@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import time
 from tqdm import tqdm
+from pathlib import Path
 from typing import List, Dict, Any
 import torch
 import warnings
@@ -21,10 +22,10 @@ from transformers import AutoProcessor
 from dataset_utils import load_videomme_dataset, build_videomme_prompt
 from eval_utils import build_judge, eval_single_sample
 
-# Set vLLM multiprocessing method
-os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
+# Set vLLM multiprocessing method unless the launcher already chose one.
+os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
 
-def prepare_inputs_for_vllm(messages, processor):
+def prepare_inputs_for_vllm(messages, processor, codec_video_id=None):
     """
     Prepare inputs for vLLM (following the examples in README.md).
     
@@ -50,6 +51,12 @@ def prepare_inputs_for_vllm(messages, processor):
         mm_data['image'] = image_inputs
     if video_inputs is not None:
         mm_data['video'] = video_inputs
+        video_kwargs = dict(video_kwargs)
+        # qwen_vl_utils.process_vision_info already decodes and resizes videos.
+        # Keep HF/vLLM's video processor from resizing the tensor a second time.
+        video_kwargs["do_resize"] = False
+        if codec_video_id is not None:
+            video_kwargs["codec_video_ids"] = [str(codec_video_id)] * len(video_inputs)
     
     return {
         'prompt': text,
@@ -63,6 +70,8 @@ def run_inference(args):
     print("🚀 VideoMME Inference with vLLM (High-Speed Mode)")
     print("="*80 + "\n")
     
+    configure_codec_guidance(args)
+
     # Load dataset
     data = load_videomme_dataset(args.data_dir, duration=args.duration)
     print(f"✓ Loaded {len(data)} samples from VideoMME (duration={args.duration})")
@@ -136,76 +145,117 @@ def run_inference(args):
     )
     print("✓ vLLM initialized successfully\n")
     
-    # Prepare all inputs
-    print("Preparing inputs for vLLM...")
-    all_inputs = []
-    all_annotations = []
-    all_messages = []
-    
-    for idx, data_item in enumerate(tqdm(data, desc="Building prompts")):
-        # Build prompt
-        messages, annotation = build_videomme_prompt(
-            data_item, 
-            args.data_dir,
-            use_subtitle=args.use_subtitle,
-            fps=args.fps,
-            min_frames=args.min_frames,
-            max_frames=args.max_frames,
-            min_pixels=args.min_pixels,
-            max_pixels=args.max_pixels,
-            total_pixels=args.total_pixels,
-            sys_prompt=sys_prompt
-        )
-        
-        # Prepare input for vLLM
-        vllm_input = prepare_inputs_for_vllm(messages, processor)
-        
-        all_inputs.append(vllm_input)
-        all_annotations.append(annotation)
-        all_messages.append(messages)
-    
-    print(f"✓ Prepared {len(all_inputs)} inputs\n")
-    
-    # Batch inference (vLLM automatic optimization)
+    # Chunked inference. Preparing all videos up front can consume too much CPU
+    # memory for VideoMME, especially at max_frames=128.
     print("="*80)
-    print("🚀 Running vLLM batch inference (automatic optimization)")
+    print("🚀 Running vLLM batch inference (chunked preparation)")
     print("="*80)
     start_time = time.time()
-    
-    outputs = llm.generate(all_inputs, sampling_params=sampling_params)
-    
+    chunk_size = max(1, int(args.prepare_batch_size))
+    results = []
+
+    with open(args.output_file, 'w') as f:
+        for start in tqdm(range(0, len(data), chunk_size), desc="Inference chunks"):
+            chunk = data[start:start + chunk_size]
+            chunk_inputs = []
+            chunk_annotations = []
+            chunk_messages = []
+
+            for data_item in chunk:
+                messages, annotation = build_videomme_prompt(
+                    data_item,
+                    args.data_dir,
+                    use_subtitle=args.use_subtitle,
+                    fps=args.fps,
+                    min_frames=args.min_frames,
+                    max_frames=args.max_frames,
+                    min_pixels=args.min_pixels,
+                    max_pixels=args.max_pixels,
+                    total_pixels=args.total_pixels,
+                    sys_prompt=sys_prompt,
+                    video_dir=args.video_dir,
+                )
+
+                vllm_input = prepare_inputs_for_vllm(
+                    messages,
+                    processor,
+                    codec_video_id=data_item.get("videoID") if args.codec_guided_mode != "none" else None,
+                )
+
+                chunk_inputs.append(vllm_input)
+                chunk_annotations.append(annotation)
+                chunk_messages.append(messages)
+
+            outputs = llm.generate(chunk_inputs, sampling_params=sampling_params)
+
+            for annotation, messages, output in zip(chunk_annotations, chunk_messages, outputs):
+                response = output.outputs[0].text
+                response_final = str(response).split("</think>")[-1].strip()
+                result = {
+                    "question_id": annotation['question_id'],
+                    "annotation": annotation,
+                    "task": f"VideoMME_{args.duration}_{'w_subtitle' if args.use_subtitle else 'wo_subtitle'}",
+                    "result": {"gen": response_final, "gen_raw": response},
+                    "messages": messages
+                }
+                results.append(result)
+                f.write(json.dumps(result) + '\n')
+                f.flush()
+
+            del chunk_inputs, chunk_annotations, chunk_messages, outputs
+
     end_time = time.time()
     total_time = end_time - start_time
     print(f"\n✓ Inference completed in {total_time:.2f} seconds")
     print(f"  Average: {total_time/len(data):.2f} seconds/sample")
     print(f"  Throughput: {len(data)/total_time:.2f} samples/second\n")
     
-    # Save results
-    print("Saving results...")
-    results = []
-    
-    for idx, (annotation, messages, output) in enumerate(zip(all_annotations, all_messages, outputs)):
-        response = output.outputs[0].text
-        
-        # Handle </think> tag if present
-        response_final = str(response).split("</think>")[-1].strip()
-        
-        result = {
-            "question_id": annotation['question_id'],
-            "annotation": annotation,
-            "task": f"VideoMME_{args.duration}_{'w_subtitle' if args.use_subtitle else 'wo_subtitle'}",
-            "result": {"gen": response_final, "gen_raw": response},
-            "messages": messages
-        }
-        results.append(result)
-    
-    # Write final results
-    with open(args.output_file, 'w') as f:
-        for res in results:
-            f.write(json.dumps(res) + '\n')
-    
     print(f"\n✓ Results saved to {args.output_file}")
     print(f"✓ Total samples processed: {len(results)}")
+
+
+def configure_codec_guidance(args):
+    mode = getattr(args, "codec_guided_mode", "none")
+    if mode == "none":
+        return
+
+    repo_root = Path(__file__).resolve().parents[2]
+    profile_to_zip = {
+        "f128_eq16": repo_root / "codec_f128_eq16.zip",
+        "f64_eq8": repo_root / "codec_f64_eqf8.zip",
+    }
+    profile_to_max_frames = {
+        "f128_eq16": 128,
+        "f64_eq8": 64,
+    }
+
+    if args.codec_guide_zip:
+        guide_zip = Path(args.codec_guide_zip)
+    else:
+        guide_zip = profile_to_zip.get(args.codec_guide_profile)
+        if guide_zip is None:
+            raise ValueError("--codec-guide-zip is required when --codec-guide-profile custom is used")
+
+    if not guide_zip.exists():
+        raise FileNotFoundError(f"Codec guidance zip not found: {guide_zip}")
+
+    if not args.no_codec_profile_overrides:
+        profiled_max_frames = profile_to_max_frames.get(args.codec_guide_profile)
+        if profiled_max_frames is not None:
+            args.max_frames = profiled_max_frames
+
+    os.environ["QWEN3VL_CODEC_GUIDED_MODE"] = mode
+    os.environ["QWEN3VL_CODEC_GUIDE_ZIP"] = str(guide_zip)
+
+    from vllm_qwen3_vl_codec_guided import apply_patch as apply_qwen3_vl_codec_patch
+
+    apply_qwen3_vl_codec_patch(mode=mode, guide_zip=str(guide_zip))
+
+    print("\n⚙️  Codec-guided vLLM patch:")
+    print(f"   mode={mode}")
+    print(f"   profile={args.codec_guide_profile}")
+    print(f"   guide_zip={guide_zip}")
+    print(f"   max_frames={args.max_frames}")
 
 def run_evaluation(args):
     """Run evaluation on inference results."""
@@ -217,7 +267,15 @@ def run_evaluation(args):
             annotation = job["annotation"]
             annotation["prediction"] = job["result"]["gen"]
             annotation["index"] = job["question_id"]
-            annotation["category"] = annotation["domain"]
+            annotation["category"] = annotation.get("category", annotation.get("domain", "unknown"))
+            annotation["domain"] = annotation.get("domain", annotation["category"])
+            annotation["duration"] = annotation.get("duration", "unknown")
+            annotation["sub_category"] = annotation.get("sub_category", "unknown")
+            annotation["task_category"] = annotation.get(
+                "task_category",
+                annotation.get("task_type", annotation["sub_category"]),
+            )
+            annotation["task_type"] = annotation.get("task_type", annotation["task_category"])
             results.append(annotation)
             
     data = pd.DataFrame.from_records(results)
@@ -281,6 +339,33 @@ def run_evaluation(args):
     for sub_category, subcat_results in results_by_subcategory.items():
         subcat_accuracy = sum(r['hit'] for r in subcat_results) / len(subcat_results)
         accuracy_by_subcategory[sub_category] = subcat_accuracy
+
+    # Calculate accuracy by task category. VideoMME uses task_category; keep a
+    # task_type alias for downstream scripts that expect that name.
+    results_by_task_category = {}
+    for result in eval_results:
+        task_category = result.get('task_category', result.get('task_type', result.get('sub_category', 'unknown')))
+        if task_category not in results_by_task_category:
+            results_by_task_category[task_category] = []
+        results_by_task_category[task_category].append(result)
+
+    accuracy_by_task_category = {}
+    for task_category, task_results in results_by_task_category.items():
+        task_accuracy = sum(r['hit'] for r in task_results) / len(task_results)
+        accuracy_by_task_category[task_category] = task_accuracy
+
+    # Calculate accuracy by duration.
+    results_by_duration = {}
+    for result in eval_results:
+        duration = result.get('duration', 'unknown')
+        if duration not in results_by_duration:
+            results_by_duration[duration] = []
+        results_by_duration[duration].append(result)
+
+    accuracy_by_duration = {}
+    for duration, duration_results in results_by_duration.items():
+        duration_accuracy = sum(r['hit'] for r in duration_results) / len(duration_results)
+        accuracy_by_duration[duration] = duration_accuracy
     
     # Save results
     output_df = pd.DataFrame(eval_results)
@@ -291,7 +376,10 @@ def run_evaluation(args):
         json.dump({
             "overall_accuracy": accuracy,
             "accuracy_by_category": accuracy_by_category,
-            "accuracy_by_subcategory": accuracy_by_subcategory
+            "accuracy_by_subcategory": accuracy_by_subcategory,
+            "accuracy_by_task_category": accuracy_by_task_category,
+            "accuracy_by_task_type": accuracy_by_task_category,
+            "accuracy_by_duration": accuracy_by_duration
         }, f, indent=2)
     
     # Also save as TSV format (consistent with original implementation)
@@ -312,6 +400,8 @@ def main():
     infer_parser = subparsers.add_parser("infer", help="Run inference with vLLM")
     infer_parser.add_argument("--model-path", type=str, required=True, help="Path to the model")
     infer_parser.add_argument("--data-dir", type=str, required=True, help="VideoMME data directory")
+    infer_parser.add_argument("--video-dir", type=str, default=None,
+                            help="Directory containing VideoMME mp4 files. Defaults to <data-dir>/videos")
     infer_parser.add_argument("--duration", type=str, default="short", 
                             choices=["short", "medium", "long"],
                             help="Video duration type (short/medium/long)")
@@ -322,6 +412,8 @@ def main():
                             help="Path to system prompt file")
     infer_parser.add_argument("--max-samples", type=int, default=None,
                             help="Maximum number of samples to process (for testing, default: None = all samples)")
+    infer_parser.add_argument("--prepare-batch-size", type=int, default=16,
+                            help="Number of videos to prepare and send to vLLM per generate call")
     
     # Video processing parameters
     infer_parser.add_argument("--fps", type=int, default=2, help="Frames per second (default: 2)")
@@ -335,6 +427,16 @@ def main():
                             help="Maximum number of frames (default: 512)")
     infer_parser.add_argument("--total-pixels", type=int, default=24576*28*28,
                             help="Total pixels across all frames (default: 24576*28*28)")
+    infer_parser.add_argument("--codec-guided-mode", type=str, default="none",
+                            choices=["none", "pre_vit", "post_vit"],
+                            help="Enable codec-guided vLLM Qwen3-VL pruning")
+    infer_parser.add_argument("--codec-guide-profile", type=str, default="f128_eq16",
+                            choices=["f128_eq16", "f64_eq8", "custom"],
+                            help="Codec guidance profile: f128_eq16=max_frames 128/equiv 16, f64_eq8=max_frames 64/equiv 8")
+    infer_parser.add_argument("--codec-guide-zip", type=str, default=None,
+                            help="Custom codec guidance zip. Required for --codec-guide-profile custom")
+    infer_parser.add_argument("--no-codec-profile-overrides", action="store_true",
+                            help="Do not override --max-frames from the selected codec guidance profile")
     
     # vLLM specific parameters
     infer_parser.add_argument("--tensor-parallel-size", type=int, default=None, 
@@ -388,4 +490,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

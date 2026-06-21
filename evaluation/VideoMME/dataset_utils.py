@@ -89,7 +89,8 @@ def load_subtitles(subtitle_path, frame_timestamps):
 def build_videomme_prompt(data, data_dir, use_subtitle=False, fps=2, 
                           min_frames=4, max_frames=512, 
                           min_pixels=128*28*28, max_pixels=512*28*28, 
-                          total_pixels=24576*28*28, sys_prompt=None):
+                          total_pixels=24576*28*28, sys_prompt=None,
+                          video_dir=None):
     """
     Build VideoMME prompt (consistent with original implementation).
     
@@ -109,15 +110,17 @@ def build_videomme_prompt(data, data_dir, use_subtitle=False, fps=2,
         Tuple of (messages, annotation)
     """
     video_id = data['videoID']
-    duration = data['duration']
-    domain = data['domain']
-    sub_category = data["sub_category"]
+    duration = data.get('duration', 'unknown')
+    sub_category = data.get("sub_category", "unknown")
+    category = data.get('category', data.get('domain', sub_category))
+    task_category = data.get('task_category', data.get('task_type', sub_category))
     question = data['question']
     choices = data['options']
     answer = data['answer']
     question_id = data['question_id']
     
-    video_path = os.path.join(data_dir, 'videos', f'{video_id}.mp4')
+    video_root = video_dir or os.path.join(data_dir, 'videos')
+    video_path = os.path.join(video_root, f'{video_id}.mp4')
     subtitle_path = os.path.join(data_dir, 'subtitle', f'{video_id}.srt')
     
     # Build choices text
@@ -182,10 +185,13 @@ def build_videomme_prompt(data, data_dir, use_subtitle=False, fps=2,
         "answer": answer,
         "answer_id": answer_id,
         "video_path": video_path,
-        "domain": domain,
+        "category": category,
+        "domain": category,
+        "duration": duration,
         "sub_category": sub_category,
+        "task_category": task_category,
+        "task_type": task_category,
         "question_id": question_id
     }
     
     return messages, annotation
-

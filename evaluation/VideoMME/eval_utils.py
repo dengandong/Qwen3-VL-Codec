@@ -350,8 +350,12 @@ def eval_single_sample(args):
         "index": item['index'],
         "question_id": item['question_id'],
         "question": item['question'],
-        "domain": item['category'],
-        "sub_category": item['sub_category'],
+        "domain": item.get('category', item.get('domain', 'unknown')),
+        "category": item.get('category', item.get('domain', 'unknown')),
+        "duration": item.get('duration', 'unknown'),
+        "sub_category": item.get('sub_category', 'unknown'),
+        "task_category": item.get('task_category', item.get('task_type', item.get('sub_category', 'unknown'))),
+        "task_type": item.get('task_type', item.get('task_category', item.get('sub_category', 'unknown'))),
         "prediction": item['prediction'],
         "extracted_answer": result['opt'],
         "extraction_method": result['extract_model'],
@@ -360,4 +364,3 @@ def eval_single_sample(args):
         "gt": item['answer'],
         "hit": hit
     }
-
