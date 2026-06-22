@@ -648,11 +648,6 @@ def apply_patch(mode: str, guide_zip: str) -> None:
     orig_iter_mm_grid_hw = getattr(model_cls, "iter_mm_grid_hw", None)
     orig_static_iter_mm_grid_hw = getattr(model_cls, "_iter_mm_grid_hw", None)
     orig_get_mrope_input_positions = getattr(model_cls, "get_mrope_input_positions", None)
-    if orig_iter_mm_grid_hw is None and orig_static_iter_mm_grid_hw is None:
-        raise AttributeError(
-            "Unsupported vLLM Qwen3-VL API: neither iter_mm_grid_hw nor "
-            "_iter_mm_grid_hw exists on Qwen3VLForConditionalGeneration."
-        )
 
     qwen3_vl.Qwen3VLMultiModalProcessor._call_hf_processor = patched_call_hf_processor
     qwen3_vl.Qwen3VLMultiModalProcessor._get_mm_fields_config = patched_get_mm_fields_config
@@ -668,5 +663,13 @@ def apply_patch(mode: str, guide_zip: str) -> None:
         model_cls.get_mrope_input_positions = patched_get_mrope_input_positions
 
     _PATCHED = True
-    grid_api = "iter_mm_grid_hw" if orig_iter_mm_grid_hw is not None else "_iter_mm_grid_hw"
+    if orig_iter_mm_grid_hw is not None:
+        grid_api = "iter_mm_grid_hw"
+    elif orig_static_iter_mm_grid_hw is not None:
+        grid_api = "_iter_mm_grid_hw"
+    else:
+        # vLLM 0.11.0 has an earlier Qwen3-VL implementation without the
+        # later multimodal-pruning MRoPE helper methods. The codec-guided
+        # prompt replacement and vision pruning paths are still patched above.
+        grid_api = "none"
     print(f"[CodecGuided-vLLM] enabled mode={mode} guide={guide_zip} grid_api={grid_api}")
