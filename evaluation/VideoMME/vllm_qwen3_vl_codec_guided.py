@@ -502,19 +502,19 @@ def apply_patch(mode: str, guide_zip: str) -> None:
         sizes = selected_video_sizes(grid_thw, codec_video_indices, merge_size)
         return video_embeds.split(sizes)
 
-    def _iter_pruned_mm_grid_hw(input_tokens, mm_features, video_token_id, spatial_merge_size):
-        """Yield pruned multimodal grid info in vLLM's newer 4-field shape."""
+    def patched_iter_mm_grid_hw(self, input_tokens, mm_features):
         mode_now = _enabled_mode()
         if mode_now not in {"pre_vit", "post_vit"}:
-            raise RuntimeError("_iter_pruned_mm_grid_hw should only be used in codec-guided modes")
+            yield from orig_iter_mm_grid_hw(self, input_tokens, mm_features)
+            return
+        video_token_id = self.config.video_token_id
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
         for mm_feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
             offset = mm_feature.mm_position.offset
             if mm_feature.modality == "image":
                 t, h, w = mm_feature.data["image_grid_thw"].data.tolist()
                 assert t == 1
-                llm_grid_h = h // spatial_merge_size
-                llm_grid_w = w // spatial_merge_size
-                yield offset, llm_grid_h, llm_grid_w, llm_grid_h * llm_grid_w
+                yield offset, h // spatial_merge_size, w // spatial_merge_size
             elif mm_feature.modality == "video":
                 grid = mm_feature.data["video_grid_thw"].data
                 t, h, w = grid.tolist()
@@ -526,52 +526,10 @@ def apply_patch(mode: str, guide_zip: str) -> None:
                     counts = [dense_h * dense_w] * int(t)
                 for count in counts:
                     offset = input_tokens.index(video_token_id, offset)
-                    yield offset, 1, int(count), int(count)
+                    yield offset, 1, int(count)
                     offset += int(count)
             else:
                 raise ValueError(f"Unsupported modality: {mm_feature.modality}")
-
-    def patched_iter_mm_grid_hw(self, input_tokens, mm_features):
-        mode_now = _enabled_mode()
-        if mode_now not in {"pre_vit", "post_vit"}:
-            yield from orig_iter_mm_grid_hw(self, input_tokens, mm_features)
-            return
-        video_token_id = self.config.video_token_id
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-        for offset, llm_grid_h, llm_grid_w, _ in _iter_pruned_mm_grid_hw(
-            input_tokens,
-            mm_features,
-            video_token_id,
-            spatial_merge_size,
-        ):
-            yield offset, llm_grid_h, llm_grid_w
-
-    def patched_static_iter_mm_grid_hw(
-        input_tokens,
-        mm_features,
-        video_token_id,
-        vision_start_token_id,
-        vision_end_token_id,
-        spatial_merge_size,
-    ):
-        mode_now = _enabled_mode()
-        if mode_now not in {"pre_vit", "post_vit"}:
-            yield from orig_static_iter_mm_grid_hw(
-                input_tokens,
-                mm_features,
-                video_token_id,
-                vision_start_token_id,
-                vision_end_token_id,
-                spatial_merge_size,
-            )
-            return
-        del vision_start_token_id, vision_end_token_id
-        yield from _iter_pruned_mm_grid_hw(
-            input_tokens,
-            mm_features,
-            video_token_id,
-            spatial_merge_size,
-        )
 
     def patched_get_mrope_input_positions(self, input_tokens, mm_features):
         mode_now = _enabled_mode()
@@ -583,14 +541,7 @@ def apply_patch(mode: str, guide_zip: str) -> None:
         st = 0
         for mm_feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
             if mm_feature.modality == "image":
-                offset, llm_grid_h, llm_grid_w, _ = next(
-                    _iter_pruned_mm_grid_hw(
-                        input_tokens,
-                        [mm_feature],
-                        video_token_id,
-                        spatial_merge_size,
-                    )
-                )
+                offset, llm_grid_h, llm_grid_w = next(self.iter_mm_grid_hw(input_tokens, [mm_feature]))
                 text_len = offset - st
                 st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
                 llm_pos_ids_list.append(np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx)
@@ -644,29 +595,17 @@ def apply_patch(mode: str, guide_zip: str) -> None:
         mrope_position_delta = (llm_positions.max() + 1 - len(input_tokens)).item()
         return torch.from_numpy(llm_positions), mrope_position_delta
 
-    model_cls = qwen3_vl.Qwen3VLForConditionalGeneration
-    orig_iter_mm_grid_hw = getattr(model_cls, "iter_mm_grid_hw", None)
-    orig_static_iter_mm_grid_hw = getattr(model_cls, "_iter_mm_grid_hw", None)
-    orig_get_mrope_input_positions = getattr(model_cls, "get_mrope_input_positions", None)
-    if orig_iter_mm_grid_hw is None and orig_static_iter_mm_grid_hw is None:
-        raise AttributeError(
-            "Unsupported vLLM Qwen3-VL API: neither iter_mm_grid_hw nor "
-            "_iter_mm_grid_hw exists on Qwen3VLForConditionalGeneration."
-        )
+    orig_iter_mm_grid_hw = qwen3_vl.Qwen3VLForConditionalGeneration.iter_mm_grid_hw
+    orig_get_mrope_input_positions = qwen3_vl.Qwen3VLForConditionalGeneration.get_mrope_input_positions
 
     qwen3_vl.Qwen3VLMultiModalProcessor._call_hf_processor = patched_call_hf_processor
     qwen3_vl.Qwen3VLMultiModalProcessor._get_mm_fields_config = patched_get_mm_fields_config
     qwen3_vl.Qwen3VLMultiModalProcessor._get_prompt_updates = patched_get_prompt_updates
     qwen3_vl.Qwen3_VisionTransformer.forward = patched_vision_forward
-    model_cls._parse_and_validate_video_input = patched_parse_video_input
-    model_cls._process_video_input = patched_process_video_input
-    if orig_iter_mm_grid_hw is not None:
-        model_cls.iter_mm_grid_hw = patched_iter_mm_grid_hw
-    if orig_static_iter_mm_grid_hw is not None:
-        model_cls._iter_mm_grid_hw = staticmethod(patched_static_iter_mm_grid_hw)
-    if orig_get_mrope_input_positions is not None:
-        model_cls.get_mrope_input_positions = patched_get_mrope_input_positions
+    qwen3_vl.Qwen3VLForConditionalGeneration._parse_and_validate_video_input = patched_parse_video_input
+    qwen3_vl.Qwen3VLForConditionalGeneration._process_video_input = patched_process_video_input
+    qwen3_vl.Qwen3VLForConditionalGeneration.iter_mm_grid_hw = patched_iter_mm_grid_hw
+    qwen3_vl.Qwen3VLForConditionalGeneration.get_mrope_input_positions = patched_get_mrope_input_positions
 
     _PATCHED = True
-    grid_api = "iter_mm_grid_hw" if orig_iter_mm_grid_hw is not None else "_iter_mm_grid_hw"
-    print(f"[CodecGuided-vLLM] enabled mode={mode} guide={guide_zip} grid_api={grid_api}")
+    print(f"[CodecGuided-vLLM] enabled mode={mode} guide={guide_zip}")
