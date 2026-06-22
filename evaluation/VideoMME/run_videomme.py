@@ -25,6 +25,77 @@ from eval_utils import build_judge, eval_single_sample
 # Set vLLM multiprocessing method unless the launcher already chose one.
 os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
 
+def configure_video_reader_backend():
+    """Patch qwen-vl-utils decord backend when its FFmpeg build is broken.
+
+    On the current cluster image, decord 0.6.0 is linked against FFmpeg 8 and
+    fails with "Option 'pix_fmts' is not a runtime option".  qwen-vl-utils then
+    falls back to torchvision, which decodes whole videos and is much slower.
+    Keep the public reader name as "decord" for existing scripts, but service it
+    with OpenCV random frame reads when enabled.
+    """
+    if os.environ.get("QWEN3VL_PATCH_DECORD_WITH_OPENCV", "1") == "0":
+        return
+
+    try:
+        from qwen_vl_utils import vision_process as vp
+        import cv2
+    except Exception as exc:
+        print(f"[VideoReader] OpenCV decord patch unavailable: {exc}")
+        return
+
+    if getattr(vp, "_qwen3vl_opencv_decord_patched", False):
+        return
+
+    def _read_video_opencv(ele):
+        video_path = ele["video"]
+        if isinstance(video_path, str) and video_path.startswith("file://"):
+            video_path = video_path[7:]
+
+        st = time.time()
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"OpenCV failed to open video: {video_path}")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_fps = float(cap.get(cv2.CAP_PROP_FPS))
+        start_frame, end_frame, total_frames = vp.calculate_video_frame_range(
+            ele,
+            total_frames,
+            video_fps,
+        )
+        nframes = vp.smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
+        idx = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
+
+        frames = []
+        for frame_idx in idx:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                cap.release()
+                raise RuntimeError(f"OpenCV failed to read frame {frame_idx} from {video_path}")
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(torch.from_numpy(frame).permute(2, 0, 1))
+
+        cap.release()
+        video = torch.stack(frames, dim=0)
+        sample_fps = nframes / max(total_frames, 1e-6) * video_fps
+        vp.logger.info(
+            f"opencv-decord:  video_path={video_path!r}, total_frames={total_frames}, "
+            f"video_fps={video_fps}, time={time.time() - st:.3f}s"
+        )
+        video_metadata = dict(
+            fps=video_fps,
+            frames_indices=idx,
+            total_num_frames=total_frames,
+            video_backend="opencv-decord",
+        )
+        return video, video_metadata, sample_fps
+
+    vp.VIDEO_READER_BACKENDS["decord"] = _read_video_opencv
+    vp._qwen3vl_opencv_decord_patched = True
+    print("[VideoReader] patched qwen-vl-utils decord backend with OpenCV random frame reader")
+
 def prepare_inputs_for_vllm(messages, processor, codec_video_id=None):
     """
     Prepare inputs for vLLM (following the examples in README.md).
@@ -70,6 +141,7 @@ def run_inference(args):
     print("🚀 VideoMME Inference with vLLM (High-Speed Mode)")
     print("="*80 + "\n")
     
+    configure_video_reader_backend()
     configure_vcast(args)
     configure_codec_guidance(args)
 
