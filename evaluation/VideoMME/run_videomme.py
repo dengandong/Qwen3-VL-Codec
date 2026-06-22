@@ -70,6 +70,7 @@ def run_inference(args):
     print("🚀 VideoMME Inference with vLLM (High-Speed Mode)")
     print("="*80 + "\n")
     
+    configure_vcast(args)
     configure_codec_guidance(args)
 
     # Load dataset
@@ -218,6 +219,8 @@ def configure_codec_guidance(args):
     mode = getattr(args, "codec_guided_mode", "none")
     if mode == "none":
         return
+    if getattr(args, "vcast_mode", "none") != "none":
+        raise ValueError("--codec-guided-mode and --vcast-mode cannot be enabled together")
 
     repo_root = Path(__file__).resolve().parents[2]
     profile_to_zip = {
@@ -256,6 +259,31 @@ def configure_codec_guidance(args):
     print(f"   profile={args.codec_guide_profile}")
     print(f"   guide_zip={guide_zip}")
     print(f"   max_frames={args.max_frames}")
+
+
+def configure_vcast(args):
+    mode = getattr(args, "vcast_mode", "none")
+    if mode == "none":
+        return
+    if getattr(args, "codec_guided_mode", "none") != "none":
+        raise ValueError("--vcast-mode and --codec-guided-mode cannot be enabled together")
+
+    os.environ["QWEN3VL_VCAST_MODE"] = mode
+    os.environ["QWEN3VL_VCAST_RETAIN_RATIO"] = str(args.vcast_retain_ratio)
+    os.environ["QWEN3VL_VCAST_MIN_K"] = str(args.vcast_min_k)
+
+    from vllm_qwen3_vl_vcast import apply_patch as apply_qwen3_vl_vcast_patch
+
+    apply_qwen3_vl_vcast_patch(
+        mode=mode,
+        retain_ratio=args.vcast_retain_ratio,
+        min_k=args.vcast_min_k,
+    )
+
+    print("\n⚙️  V-CAST vLLM patch:")
+    print(f"   mode={mode}")
+    print(f"   retain_ratio={args.vcast_retain_ratio}")
+    print(f"   min_k={args.vcast_min_k}")
 
 def run_evaluation(args):
     """Run evaluation on inference results."""
@@ -437,6 +465,13 @@ def main():
                             help="Custom codec guidance zip. Required for --codec-guide-profile custom")
     infer_parser.add_argument("--no-codec-profile-overrides", action="store_true",
                             help="Do not override --max-frames from the selected codec guidance profile")
+    infer_parser.add_argument("--vcast-mode", type=str, default="none",
+                            choices=["none", "post_vit"],
+                            help="Enable V-CAST online post-ViT token pruning for vLLM Qwen3-VL")
+    infer_parser.add_argument("--vcast-retain-ratio", type=float, default=0.25,
+                            help="V-CAST retain ratio over video tokens (default: 0.25)")
+    infer_parser.add_argument("--vcast-min-k", type=int, default=1,
+                            help="Minimum retained tokens per video frame for V-CAST (default: 1)")
     
     # vLLM specific parameters
     infer_parser.add_argument("--tensor-parallel-size", type=int, default=None, 
