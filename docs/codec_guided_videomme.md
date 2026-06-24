@@ -34,7 +34,7 @@ Use the same package family as the cluster run:
 - PyTorch with CUDA
 - vLLM 0.12.x
 - transformers with Qwen3-VL support
-- qwen-vl-utils from this repo or an equivalent installed version
+- qwen-vl-utils installed in the active Python environment
 - datasets, pandas, numpy, tqdm
 
 The vLLM worker multiprocessing method must be `fork` so the runtime monkey-patch is inherited by EngineCore workers:

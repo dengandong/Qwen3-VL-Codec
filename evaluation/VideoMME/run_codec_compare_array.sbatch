@@ -16,7 +16,8 @@ set -euo pipefail
 cd /u/adeng2/code/Qwen3-VL/evaluation/VideoMME
 mkdir -p /work/nvme/bglg/adeng2/qwen3vl_vllm_compare_jobs
 
-export PATH="/projects/bffz/adeng2/conda_envs/longvt-rft-eval/bin:${PATH}"
+export QWEN3VL_ENV_BIN="${QWEN3VL_ENV_BIN:-/work/nvme/bglg/adeng2/conda_envs/qwen3vl-codec-eval/bin}"
+export PATH="${QWEN3VL_ENV_BIN}:${PATH}"
 export HF_HOME="${HF_HOME:-/work/nvme/bglg/adeng2/hf_cache}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/work/nvme/bglg/adeng2/hf_cache/datasets}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn

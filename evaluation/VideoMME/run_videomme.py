@@ -13,6 +13,12 @@ import warnings
 import string
 import traceback
 
+# Pick qwen-vl-utils' video backend before importing qwen_vl_utils.  If this is
+# left unset, the current environment prefers torchcodec, whose installed binary
+# is incompatible with this PyTorch/FFmpeg stack and falls back to slow
+# torchvision after printing a large traceback.
+os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "decord")
+
 # vLLM imports
 from vllm import LLM, SamplingParams
 from qwen_vl_utils import process_vision_info
@@ -26,15 +32,13 @@ from eval_utils import build_judge, eval_single_sample
 os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
 
 def configure_video_reader_backend():
-    """Patch qwen-vl-utils decord backend when its FFmpeg build is broken.
+    """Optionally patch qwen-vl-utils decord backend with OpenCV.
 
-    On the current cluster image, decord 0.6.0 is linked against FFmpeg 8 and
-    fails with "Option 'pix_fmts' is not a runtime option".  qwen-vl-utils then
-    falls back to torchvision, which decodes whole videos and is much slower.
-    Keep the public reader name as "decord" for existing scripts, but service it
-    with OpenCV random frame reads when enabled.
+    This fallback is only for environments where the native decord/FFmpeg build
+    is broken. The default path uses real decord so experiments benefit from
+    FFmpeg-backed random access when available.
     """
-    if os.environ.get("QWEN3VL_PATCH_DECORD_WITH_OPENCV", "1") == "0":
+    if os.environ.get("QWEN3VL_PATCH_DECORD_WITH_OPENCV", "0") != "1":
         return
 
     try:
@@ -96,7 +100,12 @@ def configure_video_reader_backend():
     vp._qwen3vl_opencv_decord_patched = True
     print("[VideoReader] patched qwen-vl-utils decord backend with OpenCV random frame reader")
 
-def prepare_inputs_for_vllm(messages, processor, codec_video_id=None):
+def prepare_inputs_for_vllm(
+    messages,
+    processor,
+    codec_video_id=None,
+    echoprune_query_text=None,
+):
     """
     Prepare inputs for vLLM (following the examples in README.md).
     
@@ -128,6 +137,8 @@ def prepare_inputs_for_vllm(messages, processor, codec_video_id=None):
         video_kwargs["do_resize"] = False
         if codec_video_id is not None:
             video_kwargs["codec_video_ids"] = [str(codec_video_id)] * len(video_inputs)
+        if echoprune_query_text is not None:
+            video_kwargs["echoprune_query_texts"] = [str(echoprune_query_text)] * len(video_inputs)
     
     return {
         'prompt': text,
@@ -142,6 +153,8 @@ def run_inference(args):
     print("="*80 + "\n")
     
     configure_video_reader_backend()
+    configure_echoprune(args)
+    configure_ttf(args)
     configure_vcast(args)
     configure_codec_guidance(args)
 
@@ -207,7 +220,7 @@ def run_inference(args):
     print(f"   GPU count: {torch.cuda.device_count()}")
     print(f"   Tensor parallel size: {args.tensor_parallel_size}")
     
-    llm = LLM(
+    llm_kwargs = dict(
         model=args.model_path,
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
@@ -216,6 +229,16 @@ def run_inference(args):
         limit_mm_per_prompt={"video": args.max_videos_per_prompt},
         seed=args.seed,
     )
+    if (
+        getattr(args, "ttf_mode", "none") != "none"
+        or getattr(args, "echoprune_mode", "none") != "none"
+    ):
+        # This only enables vLLM's multimodal-pruning lifecycle so our patched
+        # Qwen3-VL model can recompute sparse M-RoPE after encoder output.
+        # Retained counts are controlled by the method-specific args.
+        llm_kwargs["video_pruning_rate"] = 1e-6
+
+    llm = LLM(**llm_kwargs)
     print("✓ vLLM initialized successfully\n")
     
     # Chunked inference. Preparing all videos up front can consume too much CPU
@@ -249,10 +272,21 @@ def run_inference(args):
                     video_dir=args.video_dir,
                 )
 
+                echoprune_query_text = None
+                if getattr(args, "echoprune_mode", "none") != "none":
+                    from vllm_qwen3_vl_echoprune import build_echoprune_query_text
+
+                    echoprune_query_text = build_echoprune_query_text(
+                        annotation,
+                        messages,
+                        query_source=args.echoprune_query_source,
+                    )
+
                 vllm_input = prepare_inputs_for_vllm(
                     messages,
                     processor,
                     codec_video_id=data_item.get("videoID") if args.codec_guided_mode != "none" else None,
+                    echoprune_query_text=echoprune_query_text,
                 )
 
                 chunk_inputs.append(vllm_input)
@@ -291,8 +325,12 @@ def configure_codec_guidance(args):
     mode = getattr(args, "codec_guided_mode", "none")
     if mode == "none":
         return
+    if getattr(args, "echoprune_mode", "none") != "none":
+        raise ValueError("--codec-guided-mode and --echoprune-mode cannot be enabled together")
     if getattr(args, "vcast_mode", "none") != "none":
         raise ValueError("--codec-guided-mode and --vcast-mode cannot be enabled together")
+    if getattr(args, "ttf_mode", "none") != "none":
+        raise ValueError("--codec-guided-mode and --ttf-mode cannot be enabled together")
 
     repo_root = Path(__file__).resolve().parents[2]
     profile_to_zip = {
@@ -321,13 +359,22 @@ def configure_codec_guidance(args):
 
     os.environ["QWEN3VL_CODEC_GUIDED_MODE"] = mode
     os.environ["QWEN3VL_CODEC_GUIDE_ZIP"] = str(guide_zip)
+    os.environ["QWEN3VL_CODEC_SELECTION_STRATEGY"] = args.codec_selection_strategy
+    os.environ["QWEN3VL_CODEC_RANDOM_SEED"] = str(args.codec_random_seed)
 
     from vllm_qwen3_vl_codec_guided import apply_patch as apply_qwen3_vl_codec_patch
 
-    apply_qwen3_vl_codec_patch(mode=mode, guide_zip=str(guide_zip))
+    apply_qwen3_vl_codec_patch(
+        mode=mode,
+        guide_zip=str(guide_zip),
+        selection_strategy=args.codec_selection_strategy,
+        random_seed=args.codec_random_seed,
+    )
 
     print("\n⚙️  Codec-guided vLLM patch:")
     print(f"   mode={mode}")
+    print(f"   selection_strategy={args.codec_selection_strategy}")
+    print(f"   random_seed={args.codec_random_seed}")
     print(f"   profile={args.codec_guide_profile}")
     print(f"   guide_zip={guide_zip}")
     print(f"   max_frames={args.max_frames}")
@@ -337,8 +384,12 @@ def configure_vcast(args):
     mode = getattr(args, "vcast_mode", "none")
     if mode == "none":
         return
+    if getattr(args, "echoprune_mode", "none") != "none":
+        raise ValueError("--vcast-mode and --echoprune-mode cannot be enabled together")
     if getattr(args, "codec_guided_mode", "none") != "none":
         raise ValueError("--vcast-mode and --codec-guided-mode cannot be enabled together")
+    if getattr(args, "ttf_mode", "none") != "none":
+        raise ValueError("--vcast-mode and --ttf-mode cannot be enabled together")
 
     os.environ["QWEN3VL_VCAST_MODE"] = mode
     os.environ["QWEN3VL_VCAST_RETAIN_RATIO"] = str(args.vcast_retain_ratio)
@@ -356,6 +407,144 @@ def configure_vcast(args):
     print(f"   mode={mode}")
     print(f"   retain_ratio={args.vcast_retain_ratio}")
     print(f"   min_k={args.vcast_min_k}")
+
+
+def configure_ttf(args):
+    mode = getattr(args, "ttf_mode", "none")
+    if mode == "none":
+        return
+    if getattr(args, "echoprune_mode", "none") != "none":
+        raise ValueError("--ttf-mode and --echoprune-mode cannot be enabled together")
+    if getattr(args, "codec_guided_mode", "none") != "none":
+        raise ValueError("--ttf-mode and --codec-guided-mode cannot be enabled together")
+    if getattr(args, "vcast_mode", "none") != "none":
+        raise ValueError("--ttf-mode and --vcast-mode cannot be enabled together")
+
+    version = getattr(args, "ttf_version", "v1")
+    if version == "v2":
+        os.environ["QWEN3VL_TTF_V2_MODE"] = mode
+        os.environ["QWEN3VL_TTF_V2_THRESHOLD"] = str(args.ttf_threshold)
+        os.environ["QWEN3VL_TTF_V2_BUDGET_MODE"] = args.ttf_budget_mode
+        os.environ["QWEN3VL_TTF_V2_RETAIN_RATIO"] = str(args.ttf_retain_ratio)
+        os.environ["QWEN3VL_TTF_V2_WINDOW_RADIUS"] = str(args.ttf_window_radius)
+        os.environ["QWEN3VL_TTF_V2_ANCHOR"] = args.ttf_anchor
+        os.environ["QWEN3VL_TTF_V2_ORDER"] = args.ttf_order
+        os.environ["QWEN3VL_TTF_V2_TEMPORAL_ANCHOR_RADIUS"] = str(
+            args.ttf_v2_temporal_anchor_radius
+        )
+        os.environ["QWEN3VL_TTF_V2_DEBUG_VERIFY"] = "1" if args.ttf_debug_verify else "0"
+
+        from vllm_qwen3_vl_ttf_v2 import apply_patch as apply_qwen3_vl_ttf_patch
+
+        apply_qwen3_vl_ttf_patch(
+            mode=mode,
+            threshold=args.ttf_threshold,
+            budget_mode=args.ttf_budget_mode,
+            retain_ratio=args.ttf_retain_ratio,
+            window_radius=args.ttf_window_radius,
+            anchor=args.ttf_anchor,
+            order=args.ttf_order,
+            temporal_anchor_radius=args.ttf_v2_temporal_anchor_radius,
+            debug_verify=args.ttf_debug_verify,
+        )
+    else:
+        os.environ["QWEN3VL_TTF_MODE"] = mode
+        os.environ["QWEN3VL_TTF_THRESHOLD"] = str(args.ttf_threshold)
+        os.environ["QWEN3VL_TTF_BUDGET_MODE"] = args.ttf_budget_mode
+        os.environ["QWEN3VL_TTF_RETAIN_RATIO"] = str(args.ttf_retain_ratio)
+        os.environ["QWEN3VL_TTF_WINDOW_RADIUS"] = str(args.ttf_window_radius)
+        os.environ["QWEN3VL_TTF_ANCHOR"] = args.ttf_anchor
+        os.environ["QWEN3VL_TTF_ORDER"] = args.ttf_order
+        os.environ["QWEN3VL_TTF_DEBUG_VERIFY"] = "1" if args.ttf_debug_verify else "0"
+
+        from vllm_qwen3_vl_ttf import apply_patch as apply_qwen3_vl_ttf_patch
+
+        apply_qwen3_vl_ttf_patch(
+            mode=mode,
+            threshold=args.ttf_threshold,
+            budget_mode=args.ttf_budget_mode,
+            retain_ratio=args.ttf_retain_ratio,
+            window_radius=args.ttf_window_radius,
+            anchor=args.ttf_anchor,
+            order=args.ttf_order,
+            debug_verify=args.ttf_debug_verify,
+        )
+
+    print("\n⚙️  TTF vLLM patch:")
+    print(f"   version={version}")
+    print(f"   mode={mode}")
+    print(f"   budget_mode={args.ttf_budget_mode}")
+    print(f"   retain_ratio={args.ttf_retain_ratio}")
+    print(f"   threshold={args.ttf_threshold}")
+    print(f"   window_radius={args.ttf_window_radius}")
+    print(f"   anchor={args.ttf_anchor}")
+    print(f"   order={args.ttf_order}")
+    if version == "v2":
+        print(f"   temporal_anchor_radius={args.ttf_v2_temporal_anchor_radius}")
+    print(f"   debug_verify={args.ttf_debug_verify}")
+
+
+def configure_echoprune(args):
+    mode = getattr(args, "echoprune_mode", "none")
+    if mode == "none":
+        return
+    conflicts = []
+    if getattr(args, "codec_guided_mode", "none") != "none":
+        conflicts.append("--codec-guided-mode")
+    if getattr(args, "vcast_mode", "none") != "none":
+        conflicts.append("--vcast-mode")
+    if getattr(args, "ttf_mode", "none") != "none":
+        conflicts.append("--ttf-mode")
+    if conflicts:
+        raise ValueError(
+            "--echoprune-mode cannot be enabled together with "
+            + ", ".join(conflicts)
+        )
+
+    target_visual_tokens = getattr(args, "echoprune_target_visual_tokens", None)
+    if target_visual_tokens is not None and target_visual_tokens <= 0:
+        target_visual_tokens = None
+
+    os.environ["QWEN3VL_ECHOPRUNE_MODE"] = mode
+    os.environ["QWEN3VL_ECHOPRUNE_RETAIN_RATIO"] = str(args.echoprune_retain_ratio)
+    os.environ["QWEN3VL_ECHOPRUNE_TARGET_VISUAL_TOKENS"] = (
+        "" if target_visual_tokens is None else str(int(target_visual_tokens))
+    )
+    os.environ["QWEN3VL_ECHOPRUNE_TEMPERATURE"] = str(args.echoprune_temperature)
+    os.environ["QWEN3VL_ECHOPRUNE_MATCH_SCOPE"] = args.echoprune_match_scope
+    os.environ["QWEN3VL_ECHOPRUNE_WINDOW_SIZE"] = str(args.echoprune_window_size)
+    os.environ["QWEN3VL_ECHOPRUNE_FIRST_FRAME_POLICY"] = args.echoprune_first_frame_policy
+    os.environ["QWEN3VL_ECHOPRUNE_QUERY_SOURCE"] = args.echoprune_query_source
+    os.environ["QWEN3VL_ECHOPRUNE_MATCH_CHUNK_SIZE"] = str(args.echoprune_match_chunk_size)
+    os.environ["QWEN3VL_ECHOPRUNE_DEBUG_VERIFY"] = "1" if args.echoprune_debug_verify else "0"
+
+    from vllm_qwen3_vl_echoprune import apply_patch as apply_qwen3_vl_echoprune_patch
+
+    apply_qwen3_vl_echoprune_patch(
+        mode=mode,
+        retain_ratio=args.echoprune_retain_ratio,
+        target_visual_tokens=target_visual_tokens,
+        temperature=args.echoprune_temperature,
+        match_scope=args.echoprune_match_scope,
+        window_size=args.echoprune_window_size,
+        first_frame_policy=args.echoprune_first_frame_policy,
+        query_source=args.echoprune_query_source,
+        match_chunk_size=args.echoprune_match_chunk_size,
+        debug_verify=args.echoprune_debug_verify,
+    )
+
+    print("\n⚙️  EchoPrune vLLM patch:")
+    print(f"   mode={mode}")
+    print(f"   retain_ratio={args.echoprune_retain_ratio}")
+    print(f"   target_visual_tokens={target_visual_tokens}")
+    print(f"   temperature={args.echoprune_temperature}")
+    print(f"   match_scope={args.echoprune_match_scope}")
+    print(f"   window_size={args.echoprune_window_size}")
+    print(f"   first_frame_policy={args.echoprune_first_frame_policy}")
+    print(f"   query_source={args.echoprune_query_source}")
+    print(f"   match_chunk_size={args.echoprune_match_chunk_size}")
+    print(f"   debug_verify={args.echoprune_debug_verify}")
+
 
 def run_evaluation(args):
     """Run evaluation on inference results."""
@@ -537,6 +726,11 @@ def main():
                             help="Custom codec guidance zip. Required for --codec-guide-profile custom")
     infer_parser.add_argument("--no-codec-profile-overrides", action="store_true",
                             help="Do not override --max-frames from the selected codec guidance profile")
+    infer_parser.add_argument("--codec-selection-strategy", type=str, default="codec",
+                            choices=["codec", "random"],
+                            help="Select codec-ranked groups or a deterministic random baseline with the same budget")
+    infer_parser.add_argument("--codec-random-seed", type=int, default=3407,
+                            help="Stable seed for --codec-selection-strategy random")
     infer_parser.add_argument("--vcast-mode", type=str, default="none",
                             choices=["none", "post_vit"],
                             help="Enable V-CAST online post-ViT token pruning for vLLM Qwen3-VL")
@@ -544,6 +738,55 @@ def main():
                             help="V-CAST retain ratio over video tokens (default: 0.25)")
     infer_parser.add_argument("--vcast-min-k", type=int, default=1,
                             help="Minimum retained tokens per video frame for V-CAST (default: 1)")
+    infer_parser.add_argument("--ttf-mode", type=str, default="none",
+                            choices=["none", "post_vit"],
+                            help="Enable TTF post-ViT token fusion for vLLM Qwen3-VL")
+    infer_parser.add_argument("--ttf-version", type=str, default="v1",
+                            choices=["v1", "v2"],
+                            help="TTF implementation version. v2 uses dynamic local temporal anchors")
+    infer_parser.add_argument("--ttf-budget-mode", type=str, default="retain_ratio",
+                            choices=["threshold", "retain_ratio"],
+                            help="TTF budget mode. retain_ratio is the vLLM-compatible fixed-length mode")
+    infer_parser.add_argument("--ttf-retain-ratio", type=float, default=0.25,
+                            help="TTF retained ratio when --ttf-budget-mode retain_ratio (default: 0.25)")
+    infer_parser.add_argument("--ttf-threshold", type=float, default=0.70,
+                            help="TTF cosine threshold for threshold mode (default: 0.70)")
+    infer_parser.add_argument("--ttf-window-radius", type=int, default=1,
+                            help="TTF local anchor search radius (default: 1)")
+    infer_parser.add_argument("--ttf-anchor", type=str, default="auto",
+                            choices=["auto", "first", "last"],
+                            help="TTF anchor frame policy (default: auto)")
+    infer_parser.add_argument("--ttf-order", type=str, default="paper",
+                            choices=["paper", "temporal"],
+                            help="TTF output order; temporal is compatibility mode (default: paper)")
+    infer_parser.add_argument("--ttf-v2-temporal-anchor-radius", type=int, default=2,
+                            help="TTF V2 dynamic anchor temporal radius; 2 means [t-2,t+2]")
+    infer_parser.add_argument("--ttf-debug-verify", action="store_true",
+                            help="Enable strict TTF invariant logging/checks")
+    infer_parser.add_argument("--echoprune-mode", type=str, default="none",
+                            choices=["none", "post_vit"],
+                            help="Enable EchoPrune query-guided post-ViT pruning for vLLM Qwen3-VL")
+    infer_parser.add_argument("--echoprune-retain-ratio", type=float, default=0.20,
+                            help="EchoPrune visual token retain ratio (default: 0.20)")
+    infer_parser.add_argument("--echoprune-target-visual-tokens", type=int, default=None,
+                            help="Optional absolute EchoPrune visual-token budget per video")
+    infer_parser.add_argument("--echoprune-temperature", type=float, default=0.50,
+                            help="EchoPrune temporal echo softmax temperature (default: 0.50)")
+    infer_parser.add_argument("--echoprune-match-scope", type=str, default="full",
+                            choices=["full", "local"],
+                            help="EchoPrune temporal echo candidate scope (default: full)")
+    infer_parser.add_argument("--echoprune-window-size", type=int, default=3,
+                            help="Odd local-window size for --echoprune-match-scope local (default: 3)")
+    infer_parser.add_argument("--echoprune-first-frame-policy", type=str, default="paper",
+                            choices=["paper", "global"],
+                            help="EchoPrune first-frame budget policy (default: paper)")
+    infer_parser.add_argument("--echoprune-query-source", type=str, default="question_options",
+                            choices=["question_options", "user_text", "all_text"],
+                            help="Text used for EchoPrune query embeddings (default: question_options)")
+    infer_parser.add_argument("--echoprune-match-chunk-size", type=int, default=256,
+                            help="Chunk size for EchoPrune matching/relevance matmuls (default: 256)")
+    infer_parser.add_argument("--echoprune-debug-verify", action="store_true",
+                            help="Enable strict EchoPrune invariant logging/checks")
     
     # vLLM specific parameters
     infer_parser.add_argument("--tensor-parallel-size", type=int, default=None, 
@@ -556,7 +799,7 @@ def main():
                             help="Maximum videos per prompt (default: 1)")
     infer_parser.add_argument("--seed", type=int, default=3407, help="Random seed (default: 3407)")
     
-    # Generation parameters (aligned with MMMU/RealWorldQA for Instruct model)
+    # Generation parameters used for Qwen3-VL Instruct VideoMME runs.
     infer_parser.add_argument("--max-new-tokens", type=int, default=32768, 
                             help="Maximum number of tokens to generate (default: 32768)")
     infer_parser.add_argument("--temperature", type=float, default=0.7, 

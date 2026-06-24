@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import hashlib
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,17 @@ def _enabled_mode() -> str:
 
 def _verbose() -> bool:
     return os.environ.get("QWEN3VL_CODEC_GUIDED_QUIET", "0") != "1"
+
+
+def _selection_strategy() -> str:
+    return os.environ.get("QWEN3VL_CODEC_SELECTION_STRATEGY", "codec").strip().lower()
+
+
+def _random_seed() -> int:
+    try:
+        return int(os.environ.get("QWEN3VL_CODEC_RANDOM_SEED", "3407"))
+    except ValueError:
+        return 3407
 
 
 class CodecGuideStore:
@@ -165,6 +177,65 @@ def _codec_index_from_feature(mm_feature: Any) -> int:
         return -1
 
 
+def _add_temporal_coverage(selected: np.ndarray, t: int, groups_per_t: int) -> np.ndarray:
+    temporal_idx = selected // groups_per_t
+    missing = np.setdiff1d(np.arange(t, dtype=np.int64), np.unique(temporal_idx), assume_unique=False)
+    if missing.size:
+        selected = np.unique(np.concatenate([selected, missing * groups_per_t]))
+    return selected
+
+
+def _random_selected_groups_for_row(
+    row_list: list[int],
+    codec_idx: int,
+    merge_size: int,
+    codec_selected: np.ndarray,
+) -> np.ndarray | None:
+    t, h, w = row_list
+    groups_per_t = int((h // merge_size) * (w // merge_size))
+    total_groups = int(t * groups_per_t)
+    if groups_per_t <= 0:
+        return None
+
+    codec_selected = _add_temporal_coverage(codec_selected, t, groups_per_t)
+    budget = int(codec_selected.size)
+    if budget >= total_groups:
+        return None
+
+    key = (
+        f"{_random_seed()}|{_STORE.source}|{codec_idx}|"
+        f"{_STORE._index_to_video_id.get(int(codec_idx), '')}|"
+        f"{t},{h},{w}|{merge_size}|{budget}"
+    )
+    seed = int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "little") % (2**63 - 1)
+    rng = np.random.default_rng(seed)
+
+    keep: list[int] = []
+    if budget >= t:
+        for ti in range(t):
+            keep.append(int(ti * groups_per_t + rng.integers(groups_per_t)))
+
+    remaining_budget = budget - len(keep)
+    if remaining_budget > 0:
+        all_groups = np.arange(total_groups, dtype=np.int64)
+        if keep:
+            mask = np.ones(total_groups, dtype=bool)
+            mask[np.array(keep, dtype=np.int64)] = False
+            candidates = all_groups[mask]
+        else:
+            candidates = all_groups
+        extra = rng.choice(candidates, size=remaining_budget, replace=False)
+        keep.extend(int(x) for x in extra.tolist())
+
+    selected = np.array(sorted(set(keep)), dtype=np.int64)
+    if selected.size != budget:
+        raise RuntimeError(
+            f"Random codec baseline selected {selected.size} groups, expected {budget}; "
+            f"grid={row_list}, codec_idx={codec_idx}"
+        )
+    return selected
+
+
 def _selected_groups_for_row(row: Any, codec_idx: int, merge_size: int) -> np.ndarray | None:
     if codec_idx < 0:
         return None
@@ -174,15 +245,19 @@ def _selected_groups_for_row(row: Any, codec_idx: int, merge_size: int) -> np.nd
     selected = _STORE.selected_groups_np(codec_idx, row_list)
     if selected is None:
         return None
+
+    strategy = _selection_strategy()
+    if strategy == "random":
+        return _random_selected_groups_for_row(row_list, codec_idx, merge_size, selected)
+    if strategy != "codec":
+        raise ValueError(f"Unsupported codec selection strategy: {strategy}")
+
     t, h, w = row_list
     groups_per_t = int((h // merge_size) * (w // merge_size))
     total_groups = int(t * groups_per_t)
     if groups_per_t <= 0:
         return None
-    temporal_idx = selected // groups_per_t
-    missing = np.setdiff1d(np.arange(t, dtype=np.int64), np.unique(temporal_idx), assume_unique=False)
-    if missing.size:
-        selected = np.unique(np.concatenate([selected, missing * groups_per_t]))
+    selected = _add_temporal_coverage(selected, t, groups_per_t)
     if selected.size >= total_groups:
         return None
     return selected
@@ -260,7 +335,8 @@ def _select_for_grid(
 
         if _verbose() and selected_np is not None:
             print(
-                f"[CodecGuided-vLLM] video[{row_idx}] keep_groups={local_group.numel()}/{group_num} "
+                f"[CodecGuided-vLLM] video[{row_idx}] strategy={_selection_strategy()} "
+                f"keep_groups={local_group.numel()}/{group_num} "
                 f"keep_patches={local_patch.numel()}/{patch_num}"
             )
 
@@ -270,7 +346,12 @@ def _select_for_grid(
     return torch.cat(patch_chunks), torch.cat(group_chunks), torch.stack(cu_parts).to(torch.int32)
 
 
-def apply_patch(mode: str, guide_zip: str) -> None:
+def apply_patch(
+    mode: str,
+    guide_zip: str,
+    selection_strategy: str = "codec",
+    random_seed: int = 3407,
+) -> None:
     """Patch vLLM Qwen3-VL classes in the current process."""
     global _PATCHED
     mode = (mode or "off").strip().lower()
@@ -278,9 +359,14 @@ def apply_patch(mode: str, guide_zip: str) -> None:
         return
     if mode not in {"pre_vit", "post_vit"}:
         raise ValueError(f"Unsupported codec-guided mode: {mode}")
+    selection_strategy = (selection_strategy or "codec").strip().lower()
+    if selection_strategy not in {"codec", "random"}:
+        raise ValueError(f"Unsupported codec selection strategy: {selection_strategy}")
 
     os.environ["QWEN3VL_CODEC_GUIDED_MODE"] = mode
     os.environ["QWEN3VL_CODEC_GUIDE_ZIP"] = guide_zip
+    os.environ["QWEN3VL_CODEC_SELECTION_STRATEGY"] = selection_strategy
+    os.environ["QWEN3VL_CODEC_RANDOM_SEED"] = str(int(random_seed))
     _STORE.set_source(guide_zip)
 
     import vllm.model_executor.models.qwen3_vl as qwen3_vl
@@ -608,4 +694,7 @@ def apply_patch(mode: str, guide_zip: str) -> None:
     qwen3_vl.Qwen3VLForConditionalGeneration.get_mrope_input_positions = patched_get_mrope_input_positions
 
     _PATCHED = True
-    print(f"[CodecGuided-vLLM] enabled mode={mode} guide={guide_zip}")
+    print(
+        f"[CodecGuided-vLLM] enabled mode={mode} guide={guide_zip} "
+        f"strategy={selection_strategy} random_seed={random_seed}"
+    )

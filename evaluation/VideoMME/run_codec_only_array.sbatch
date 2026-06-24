@@ -16,11 +16,13 @@ set -euo pipefail
 cd /u/adeng2/code/Qwen3-VL/evaluation/VideoMME
 mkdir -p /work/nvme/bglg/adeng2/qwen3vl_codec_eval_jobs
 
-export PATH="/projects/bffz/adeng2/conda_envs/longvt-rft-eval/bin:${PATH}"
+export QWEN3VL_ENV_BIN="${QWEN3VL_ENV_BIN:-/work/nvme/bglg/adeng2/conda_envs/qwen3vl-codec-eval/bin}"
+export PATH="${QWEN3VL_ENV_BIN}:${PATH}"
 export HF_HOME="${HF_HOME:-/work/nvme/bglg/adeng2/hf_cache}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/work/nvme/bglg/adeng2/hf_cache/datasets}"
 export VLLM_WORKER_MULTIPROC_METHOD=fork
 export FORCE_QWENVL_VIDEO_READER="${FORCE_QWENVL_VIDEO_READER:-decord}"
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 DATA_DIR="${DATA_DIR:-/work/nvme/bglg/adeng2/hf_cache/videomme}"
@@ -60,6 +62,7 @@ echo "output=${OUT_FILE}"
 echo "prepare_batch_size=${PREPARE_BATCH_SIZE}"
 echo "vllm_worker_multiproc_method=${VLLM_WORKER_MULTIPROC_METHOD}"
 echo "force_qwenvl_video_reader=${FORCE_QWENVL_VIDEO_READER}"
+echo "python_no_user_site=${PYTHONNOUSERSITE}"
 
 python run_videomme.py infer \
   --model-path "${MODEL_PATH}" \

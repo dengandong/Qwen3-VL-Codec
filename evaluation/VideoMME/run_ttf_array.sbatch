@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=qwen3vl_vcast_eval
+#SBATCH --job-name=qwen3vl_ttf_eval
 #SBATCH --account=bglg-dtai-gh
 #SBATCH --partition=ghx4
 #SBATCH --nodes=1
@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=500G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-5%2
+#SBATCH --array=0-2%1
 #SBATCH --output=/work/nvme/bglg/adeng2/qwen3vl_codec_eval_jobs/%x-%A_%a.out
 #SBATCH --error=/work/nvme/bglg/adeng2/qwen3vl_codec_eval_jobs/%x-%A_%a.err
 
@@ -30,26 +30,22 @@ DATA_DIR="${DATA_DIR:-/work/nvme/bglg/adeng2/hf_cache/videomme}"
 VIDEO_DIR="${VIDEO_DIR:-/work/nvme/bglg/adeng2/hf_cache/videomme/data}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-4B-Instruct}"
 RUN_ID="${SLURM_ARRAY_JOB_ID:-manual_$(date +%Y%m%d_%H%M%S)}"
-BASE_OUT="${BASE_OUT:-/work/nvme/bglg/adeng2/qwen3vl_vcast_eval_${RUN_ID}}"
+BASE_OUT="${BASE_OUT:-/work/nvme/bglg/adeng2/qwen3vl_ttf_eval_${RUN_ID}}"
 PREPARE_BATCH_SIZE="${PREPARE_BATCH_SIZE:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.80}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
-VCAST_RETAIN_RATIO="${VCAST_RETAIN_RATIO:-0.25}"
-VCAST_MIN_K="${VCAST_MIN_K:-1}"
-VCAST_EXP_SUFFIX="${VCAST_EXP_SUFFIX:-rr025}"
+MAX_FRAMES="${MAX_FRAMES:-64}"
+TTF_RETAIN_RATIO="${TTF_RETAIN_RATIO:-0.125}"
+TTF_WINDOW_RADIUS="${TTF_WINDOW_RADIUS:-1}"
+TTF_ANCHOR="${TTF_ANCHOR:-auto}"
+TTF_ORDER="${TTF_ORDER:-paper}"
+TTF_DEBUG_VERIFY="${TTF_DEBUG_VERIFY:-1}"
 
-EXPERIMENTS=(
-  "vcast_f128_${VCAST_EXP_SUFFIX} 128"
-  "vcast_f64_${VCAST_EXP_SUFFIX} 64"
-)
 DURATIONS=(short medium long)
 
 TASK_ID="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}"
-EXP_ID=$((TASK_ID / 3))
-DUR_ID=$((TASK_ID % 3))
-
-read -r EXP_NAME MAX_FRAMES <<< "${EXPERIMENTS[$EXP_ID]}"
-DURATION="${DURATIONS[$DUR_ID]}"
+DURATION="${DURATIONS[$TASK_ID]}"
+EXP_NAME="ttf_f${MAX_FRAMES}_rr0125"
 
 OUT_DIR="${BASE_OUT}/${EXP_NAME}/${DURATION}"
 mkdir -p "${OUT_DIR}"
@@ -58,14 +54,22 @@ OUT_FILE="${OUT_DIR}/predictions.jsonl"
 echo "experiment=${EXP_NAME}"
 echo "duration=${DURATION}"
 echo "max_frames=${MAX_FRAMES}"
-echo "vcast_retain_ratio=${VCAST_RETAIN_RATIO}"
-echo "vcast_min_k=${VCAST_MIN_K}"
+echo "ttf_retain_ratio=${TTF_RETAIN_RATIO}"
+echo "ttf_window_radius=${TTF_WINDOW_RADIUS}"
+echo "ttf_anchor=${TTF_ANCHOR}"
+echo "ttf_order=${TTF_ORDER}"
+echo "ttf_debug_verify=${TTF_DEBUG_VERIFY}"
 echo "output=${OUT_FILE}"
 echo "prepare_batch_size=${PREPARE_BATCH_SIZE}"
 echo "vllm_worker_multiproc_method=${VLLM_WORKER_MULTIPROC_METHOD}"
 echo "force_qwenvl_video_reader=${FORCE_QWENVL_VIDEO_READER}"
 echo "patch_decord_with_opencv=${QWEN3VL_PATCH_DECORD_WITH_OPENCV}"
 echo "python_no_user_site=${PYTHONNOUSERSITE}"
+
+TTF_DEBUG_ARGS=()
+if [[ "${TTF_DEBUG_VERIFY}" == "1" ]]; then
+  TTF_DEBUG_ARGS+=(--ttf-debug-verify)
+fi
 
 python run_videomme.py infer \
   --model-path "${MODEL_PATH}" \
@@ -89,6 +93,10 @@ python run_videomme.py infer \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --max-model-len "${MAX_MODEL_LEN}" \
-  --vcast-mode post_vit \
-  --vcast-retain-ratio "${VCAST_RETAIN_RATIO}" \
-  --vcast-min-k "${VCAST_MIN_K}"
+  --ttf-mode post_vit \
+  --ttf-budget-mode retain_ratio \
+  --ttf-retain-ratio "${TTF_RETAIN_RATIO}" \
+  --ttf-window-radius "${TTF_WINDOW_RADIUS}" \
+  --ttf-anchor "${TTF_ANCHOR}" \
+  --ttf-order "${TTF_ORDER}" \
+  "${TTF_DEBUG_ARGS[@]}"

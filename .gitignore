@@ -1,3 +1,9 @@
 codec_f128_eq16.zip
 codec_f64_eqf8.zip
+__pycache__/
+*.py[cod]
+.pytest_cache/
 evaluation/VideoMME/__pycache__/
+evaluation/VideoMME/results/
+*.out
+*.err

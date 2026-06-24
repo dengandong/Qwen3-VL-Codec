@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=qwen3vl_vcast_eval
+#SBATCH --job-name=qwen3vl_rand_eval
 #SBATCH --account=bglg-dtai-gh
 #SBATCH --partition=ghx4
 #SBATCH --nodes=1
@@ -30,17 +30,15 @@ DATA_DIR="${DATA_DIR:-/work/nvme/bglg/adeng2/hf_cache/videomme}"
 VIDEO_DIR="${VIDEO_DIR:-/work/nvme/bglg/adeng2/hf_cache/videomme/data}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-4B-Instruct}"
 RUN_ID="${SLURM_ARRAY_JOB_ID:-manual_$(date +%Y%m%d_%H%M%S)}"
-BASE_OUT="${BASE_OUT:-/work/nvme/bglg/adeng2/qwen3vl_vcast_eval_${RUN_ID}}"
+BASE_OUT="${BASE_OUT:-/work/nvme/bglg/adeng2/qwen3vl_codec_random_eval_${RUN_ID}}"
 PREPARE_BATCH_SIZE="${PREPARE_BATCH_SIZE:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.80}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
-VCAST_RETAIN_RATIO="${VCAST_RETAIN_RATIO:-0.25}"
-VCAST_MIN_K="${VCAST_MIN_K:-1}"
-VCAST_EXP_SUFFIX="${VCAST_EXP_SUFFIX:-rr025}"
+CODEC_RANDOM_SEED="${CODEC_RANDOM_SEED:-3407}"
 
 EXPERIMENTS=(
-  "vcast_f128_${VCAST_EXP_SUFFIX} 128"
-  "vcast_f64_${VCAST_EXP_SUFFIX} 64"
+  "random_f128_eq16_post_vit f128_eq16 128"
+  "random_f64_eq8_post_vit f64_eq8 64"
 )
 DURATIONS=(short medium long)
 
@@ -48,7 +46,7 @@ TASK_ID="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}"
 EXP_ID=$((TASK_ID / 3))
 DUR_ID=$((TASK_ID % 3))
 
-read -r EXP_NAME MAX_FRAMES <<< "${EXPERIMENTS[$EXP_ID]}"
+read -r EXP_NAME CODEC_PROFILE MAX_FRAMES <<< "${EXPERIMENTS[$EXP_ID]}"
 DURATION="${DURATIONS[$DUR_ID]}"
 
 OUT_DIR="${BASE_OUT}/${EXP_NAME}/${DURATION}"
@@ -57,9 +55,11 @@ OUT_FILE="${OUT_DIR}/predictions.jsonl"
 
 echo "experiment=${EXP_NAME}"
 echo "duration=${DURATION}"
+echo "codec_mode=post_vit"
+echo "codec_profile=${CODEC_PROFILE}"
+echo "codec_selection_strategy=random"
+echo "codec_random_seed=${CODEC_RANDOM_SEED}"
 echo "max_frames=${MAX_FRAMES}"
-echo "vcast_retain_ratio=${VCAST_RETAIN_RATIO}"
-echo "vcast_min_k=${VCAST_MIN_K}"
 echo "output=${OUT_FILE}"
 echo "prepare_batch_size=${PREPARE_BATCH_SIZE}"
 echo "vllm_worker_multiproc_method=${VLLM_WORKER_MULTIPROC_METHOD}"
@@ -89,6 +89,7 @@ python run_videomme.py infer \
   --tensor-parallel-size 1 \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --max-model-len "${MAX_MODEL_LEN}" \
-  --vcast-mode post_vit \
-  --vcast-retain-ratio "${VCAST_RETAIN_RATIO}" \
-  --vcast-min-k "${VCAST_MIN_K}"
+  --codec-guided-mode post_vit \
+  --codec-guide-profile "${CODEC_PROFILE}" \
+  --codec-selection-strategy random \
+  --codec-random-seed "${CODEC_RANDOM_SEED}"
