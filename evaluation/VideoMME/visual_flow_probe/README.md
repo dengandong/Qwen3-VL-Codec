@@ -38,6 +38,220 @@ h[i] = b[i] + sum_{j > i} A[j, i] * h[j]
 The visual source responsibility is `h[i]` normalized over video placeholder
 positions. A direct-attention baseline, `mean_t A[t, i]`, is also saved.
 
+## Implementation-Aligned Pseudocode
+
+The two diagnostics below use the same attention convention and reachability DP.
+They differ only in when layer averaging happens and whether visual scores are
+normalized.
+
+### Layer 17-34 Averaged Responsibility
+
+This is the path used by `run_visual_flow_probe.py` for the layer-17-to-34 f8
+sweep. `--layer-end` is exclusive, so `--layer-start 17 --layer-end 35`
+captures decoder layers `17, ..., 34`.
+
+```text
+Input:
+  VideoMME sample
+  Qwen3-VL vLLM model and processor
+  selected_layers = [17, 18, ..., 34]
+  target_mode = decision by default
+
+1. Build the VideoMME prompt.
+   messages, annotation = build_prompt(sample)
+   prepared = prepare_vllm_prompt(processor, messages)
+
+2. Run deterministic baseline generation.
+   baseline = deterministic_vllm_generate(model, prepared.vllm_input)
+
+3. Build the teacher-forced diagnostic sequence.
+   teacher_input = prompt_tokens + baseline_generated_answer_tokens
+   answer_positions = positions of baseline answer tokens
+
+   if target_mode == "decision":
+       target_positions = [p - 1 for p in answer_positions]
+   else if target_mode == "post_answer":
+       target_positions = answer_positions
+
+4. Enable vLLM decoder-attention capture on selected_layers.
+
+   In each selected Qwen3Attention.forward:
+       qkv = qkv_proj(hidden_states)
+       q, k, v = split(qkv)
+
+       q = q_norm(q)
+       k = k_norm(k)
+       q, k = rotary_emb(positions, q, k)
+
+       logits[head, query, key] =
+           dot(q[query, head], k[key, head]) * scaling
+
+       mask logits where key > query
+       attn[head, query, key] = softmax(logits over key dimension)
+       A_layer[query, key] = mean over heads of attn[:, query, key]
+
+       store A_layer on CPU
+
+5. Force one prefill pass on the teacher-forced input.
+   llm.generate([teacher_input], max_tokens=1)
+
+6. Average attention across layers before running flow.
+   A = mean_layer A_layer
+
+   Shape:
+     A: [seq_len, seq_len]
+
+   Convention:
+     A[query, key] = attention from query position to key/source position
+     A[later_query, earlier_key] represents earlier_key -> later_query
+
+   Assert causal orientation:
+     A[query, key] ~= 0 for key > query
+
+7. Locate visual placeholder positions.
+   video_token_id = get_vllm_video_token_id(processor, model)
+   visual_positions = where teacher_input_ids == video_token_id
+
+   spatial_merge_size = get_vllm_spatial_merge_size(processor, model)
+   map visual_positions to (video, t, y, x) using video_grid_thw and
+   spatial_merge_size.
+
+8. Compute multihop answer reachability on the averaged attention graph.
+
+   b[i] = 1 / len(target_positions), if i is a target position
+          0, otherwise
+
+   h = zeros(seq_len)
+   for i from seq_len - 1 down to 0:
+       h[i] = b[i] + sum_{j > i} A[j, i] * h[j]
+
+9. Extract and normalize visual responsibility.
+   raw_visual = h[visual_positions]
+   responsibility = raw_visual / sum(raw_visual)
+
+10. Also compute the direct-attention baseline.
+    direct[v] = mean over target t of A[t, visual_positions[v]]
+    if sum(direct) > 0:
+        direct = direct / sum(direct)
+
+Output:
+  responsibility: [num_visual_tokens], normalized to sum to 1
+  direct_attention: [num_visual_tokens], normalized when possible
+  target_positions
+  visual token grid metadata
+```
+
+The important implementation detail is that this path averages the selected
+layers' attention matrices first and runs the reachability DP once. It does not
+run one DP per layer and then average the resulting responsibility vectors.
+
+### Layer-Wise Responsibility Matrix
+
+This is the path used by `run_layer_matrix_dump.py` and the 10-example plotting
+script `run_layer_dynamics.py`. It saves raw per-layer visual reachability
+curves, so values are not normalized across visual tokens.
+
+```text
+Input:
+  VideoMME sample
+  Qwen3-VL vLLM model and processor
+  layer_start, layer_end, layer_stride
+  target_mode = decision by default
+
+Example full-depth setting:
+  layer_start = 0
+  layer_end = 36       # exclusive, captures layers 0..35
+  layer_stride = 1
+
+1. Build the VideoMME prompt.
+   messages, annotation = build_prompt(sample)
+   prepared = prepare_vllm_prompt(processor, messages)
+
+2. Run deterministic baseline generation.
+   baseline = deterministic_vllm_generate(model, prepared.vllm_input)
+
+3. Build the teacher-forced diagnostic sequence.
+   teacher_input = prompt_tokens + baseline_generated_answer_tokens
+   answer_positions = positions of baseline answer tokens
+
+   if target_mode == "decision":
+       target_positions = [p - 1 for p in answer_positions]
+   else if target_mode == "post_answer":
+       target_positions = answer_positions
+
+4. Select layers.
+   selected_layers = range(layer_start, layer_end, layer_stride)
+
+5. Enable per-layer vLLM decoder-attention capture.
+
+   In each selected Qwen3Attention.forward:
+       qkv = qkv_proj(hidden_states)
+       q, k, v = split(qkv)
+
+       q = q_norm(q)
+       k = k_norm(k)
+       q, k = rotary_emb(positions, q, k)
+
+       logits[head, query, key] =
+           dot(q[query, head], k[key, head]) * scaling
+
+       mask logits where key > query
+       attn[head, query, key] = softmax(logits over key dimension)
+       A_layer[query, key] = mean over heads of attn[:, query, key]
+
+       store A_layer separately for this layer
+
+6. Force one prefill pass on the teacher-forced input.
+   llm.generate([teacher_input], max_tokens=1)
+
+7. Locate visual placeholder positions and grid coordinates.
+   video_token_id = get_vllm_video_token_id(processor, model)
+   visual_positions = where teacher_input_ids == video_token_id
+   map visual_positions to (video, t, y, x) using video_grid_thw and
+   spatial_merge_size.
+
+8. For each captured layer independently:
+
+   A_l = captured attention matrix for layer l
+
+   Assert:
+     A_l shape == [seq_len, seq_len]
+     A_l is causal
+
+   b[i] = 1 / len(target_positions), if i is a target position
+          0, otherwise
+
+   h_l = zeros(seq_len)
+   for i from seq_len - 1 down to 0:
+       h_l[i] = b[i] + sum_{j > i} A_l[j, i] * h_l[j]
+
+   curve_l = h_l[visual_positions]
+
+   Check:
+     curve_l is finite
+     curve_l is non-negative
+
+   Do not normalize curve_l over visual tokens.
+
+9. Stack curves in selected-layer order.
+   responsibility_matrix[layer_row, visual_local_index] = curve_l[visual_local_index]
+
+Output:
+  responsibility_matrix: [num_selected_layers, num_visual_tokens]
+  layers: selected layer indices
+  visual_seq_positions
+  visual_local_indices
+  temporal_grid_indices
+  y_grid_indices
+  x_grid_indices
+  video_grid_thw
+  target_positions
+```
+
+Because the layer-wise matrix stores raw `h_l[visual_positions]`, different
+layers may have different value ranges. This is intentional for layer-dynamics
+diagnostics and matches the plotting scripts.
+
 ## Target Modes
 
 `decision` is the primary target mode. For each baseline-generated answer token
