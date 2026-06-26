@@ -105,6 +105,10 @@ def prepare_inputs_for_vllm(
     processor,
     codec_video_id=None,
     echoprune_query_text=None,
+    mmtok_query_text=None,
+    vflow_question_id=None,
+    vflow_video_id=None,
+    vflow_duration=None,
 ):
     """
     Prepare inputs for vLLM (following the examples in README.md).
@@ -139,6 +143,14 @@ def prepare_inputs_for_vllm(
             video_kwargs["codec_video_ids"] = [str(codec_video_id)] * len(video_inputs)
         if echoprune_query_text is not None:
             video_kwargs["echoprune_query_texts"] = [str(echoprune_query_text)] * len(video_inputs)
+        if mmtok_query_text is not None:
+            video_kwargs["mmtok_query_texts"] = [str(mmtok_query_text)] * len(video_inputs)
+        if vflow_question_id is not None:
+            video_kwargs["vflow_question_ids"] = [str(vflow_question_id)] * len(video_inputs)
+        if vflow_video_id is not None:
+            video_kwargs["vflow_video_ids"] = [str(vflow_video_id)] * len(video_inputs)
+        if vflow_duration is not None:
+            video_kwargs["vflow_durations"] = [str(vflow_duration)] * len(video_inputs)
     
     return {
         'prompt': text,
@@ -153,6 +165,10 @@ def run_inference(args):
     print("="*80 + "\n")
     
     configure_video_reader_backend()
+    configure_vflow(args)
+    configure_kitoke(args)
+    configure_flashvid(args)
+    configure_mmtok(args)
     configure_echoprune(args)
     configure_ttf(args)
     configure_vcast(args)
@@ -232,6 +248,9 @@ def run_inference(args):
     if (
         getattr(args, "ttf_mode", "none") != "none"
         or getattr(args, "echoprune_mode", "none") != "none"
+        or getattr(args, "mmtok_mode", "none") != "none"
+        or getattr(args, "flashvid_mode", "none") != "none"
+        or getattr(args, "kitoke_mode", "none") != "none"
     ):
         # This only enables vLLM's multimodal-pruning lifecycle so our patched
         # Qwen3-VL model can recompute sparse M-RoPE after encoder output.
@@ -281,12 +300,25 @@ def run_inference(args):
                         messages,
                         query_source=args.echoprune_query_source,
                     )
+                mmtok_query_text = None
+                if getattr(args, "mmtok_mode", "none") != "none":
+                    from vllm_qwen3_vl_mmtok import build_mmtok_query_text
+
+                    mmtok_query_text = build_mmtok_query_text(
+                        annotation,
+                        messages,
+                        query_source=args.mmtok_query_source,
+                    )
 
                 vllm_input = prepare_inputs_for_vllm(
                     messages,
                     processor,
                     codec_video_id=data_item.get("videoID") if args.codec_guided_mode != "none" else None,
                     echoprune_query_text=echoprune_query_text,
+                    mmtok_query_text=mmtok_query_text,
+                    vflow_question_id=annotation.get("question_id") if getattr(args, "vflow_mode", "none") != "none" else None,
+                    vflow_video_id=data_item.get("videoID") if getattr(args, "vflow_mode", "none") != "none" else None,
+                    vflow_duration=args.duration if getattr(args, "vflow_mode", "none") != "none" else None,
                 )
 
                 chunk_inputs.append(vllm_input)
@@ -321,16 +353,85 @@ def run_inference(args):
     print(f"✓ Total samples processed: {len(results)}")
 
 
+def configure_vflow(args):
+    mode = getattr(args, "vflow_mode", "none")
+    if mode == "none":
+        return
+    conflicts = []
+    if getattr(args, "codec_guided_mode", "none") != "none":
+        conflicts.append("--codec-guided-mode")
+    if getattr(args, "vcast_mode", "none") != "none":
+        conflicts.append("--vcast-mode")
+    if getattr(args, "ttf_mode", "none") != "none":
+        conflicts.append("--ttf-mode")
+    if getattr(args, "echoprune_mode", "none") != "none":
+        conflicts.append("--echoprune-mode")
+    if getattr(args, "mmtok_mode", "none") != "none":
+        conflicts.append("--mmtok-mode")
+    if getattr(args, "flashvid_mode", "none") != "none":
+        conflicts.append("--flashvid-mode")
+    if getattr(args, "kitoke_mode", "none") != "none":
+        conflicts.append("--kitoke-mode")
+    if conflicts:
+        raise ValueError("--vflow-mode cannot be enabled together with " + ", ".join(conflicts))
+
+    target_visual_tokens = getattr(args, "vflow_target_visual_tokens", None)
+    if target_visual_tokens is not None and target_visual_tokens <= 0:
+        target_visual_tokens = None
+    responsibility_dir = getattr(args, "vflow_responsibility_dir", None)
+    if not responsibility_dir:
+        raise ValueError("--vflow-responsibility-dir is required when --vflow-mode is enabled")
+
+    os.environ["QWEN3VL_VFLOW_MODE"] = mode
+    os.environ["QWEN3VL_VFLOW_RETAIN_RATIO"] = str(args.vflow_retain_ratio)
+    os.environ["QWEN3VL_VFLOW_TARGET_VISUAL_TOKENS"] = (
+        "" if target_visual_tokens is None else str(int(target_visual_tokens))
+    )
+    os.environ["QWEN3VL_VFLOW_RESPONSIBILITY_DIR"] = str(responsibility_dir)
+    os.environ["QWEN3VL_VFLOW_SIGNAL"] = args.vflow_signal
+    os.environ["QWEN3VL_VFLOW_KEEP"] = args.vflow_keep
+    os.environ["QWEN3VL_VFLOW_DEBUG_VERIFY"] = "1" if args.vflow_debug_verify else "0"
+    os.environ["QWEN3VL_VFLOW_QUIET"] = "1" if args.vflow_quiet else "0"
+
+    from vllm_qwen3_vl_vflow import apply_patch as apply_qwen3_vl_vflow_patch
+
+    apply_qwen3_vl_vflow_patch(
+        mode=mode,
+        retain_ratio=args.vflow_retain_ratio,
+        responsibility_dir=responsibility_dir,
+        target_visual_tokens=target_visual_tokens,
+        signal=args.vflow_signal,
+        keep=args.vflow_keep,
+        debug_verify=args.vflow_debug_verify,
+        quiet=args.vflow_quiet,
+    )
+
+    print("\n⚙️  VFlow vLLM patch:")
+    print(f"   mode={mode}")
+    print(f"   retain_ratio={args.vflow_retain_ratio}")
+    print(f"   target_visual_tokens={target_visual_tokens}")
+    print(f"   responsibility_dir={responsibility_dir}")
+    print(f"   signal={args.vflow_signal}")
+    print(f"   keep={args.vflow_keep}")
+    print(f"   debug_verify={args.vflow_debug_verify}")
+
+
 def configure_codec_guidance(args):
     mode = getattr(args, "codec_guided_mode", "none")
     if mode == "none":
         return
+    if getattr(args, "flashvid_mode", "none") != "none":
+        raise ValueError("--codec-guided-mode and --flashvid-mode cannot be enabled together")
     if getattr(args, "echoprune_mode", "none") != "none":
         raise ValueError("--codec-guided-mode and --echoprune-mode cannot be enabled together")
     if getattr(args, "vcast_mode", "none") != "none":
         raise ValueError("--codec-guided-mode and --vcast-mode cannot be enabled together")
     if getattr(args, "ttf_mode", "none") != "none":
         raise ValueError("--codec-guided-mode and --ttf-mode cannot be enabled together")
+    if getattr(args, "mmtok_mode", "none") != "none":
+        raise ValueError("--codec-guided-mode and --mmtok-mode cannot be enabled together")
+    if getattr(args, "kitoke_mode", "none") != "none":
+        raise ValueError("--codec-guided-mode and --kitoke-mode cannot be enabled together")
 
     repo_root = Path(__file__).resolve().parents[2]
     profile_to_zip = {
@@ -384,12 +485,18 @@ def configure_vcast(args):
     mode = getattr(args, "vcast_mode", "none")
     if mode == "none":
         return
+    if getattr(args, "flashvid_mode", "none") != "none":
+        raise ValueError("--vcast-mode and --flashvid-mode cannot be enabled together")
     if getattr(args, "echoprune_mode", "none") != "none":
         raise ValueError("--vcast-mode and --echoprune-mode cannot be enabled together")
     if getattr(args, "codec_guided_mode", "none") != "none":
         raise ValueError("--vcast-mode and --codec-guided-mode cannot be enabled together")
     if getattr(args, "ttf_mode", "none") != "none":
         raise ValueError("--vcast-mode and --ttf-mode cannot be enabled together")
+    if getattr(args, "mmtok_mode", "none") != "none":
+        raise ValueError("--vcast-mode and --mmtok-mode cannot be enabled together")
+    if getattr(args, "kitoke_mode", "none") != "none":
+        raise ValueError("--vcast-mode and --kitoke-mode cannot be enabled together")
 
     os.environ["QWEN3VL_VCAST_MODE"] = mode
     os.environ["QWEN3VL_VCAST_RETAIN_RATIO"] = str(args.vcast_retain_ratio)
@@ -413,12 +520,18 @@ def configure_ttf(args):
     mode = getattr(args, "ttf_mode", "none")
     if mode == "none":
         return
+    if getattr(args, "flashvid_mode", "none") != "none":
+        raise ValueError("--ttf-mode and --flashvid-mode cannot be enabled together")
     if getattr(args, "echoprune_mode", "none") != "none":
         raise ValueError("--ttf-mode and --echoprune-mode cannot be enabled together")
     if getattr(args, "codec_guided_mode", "none") != "none":
         raise ValueError("--ttf-mode and --codec-guided-mode cannot be enabled together")
     if getattr(args, "vcast_mode", "none") != "none":
         raise ValueError("--ttf-mode and --vcast-mode cannot be enabled together")
+    if getattr(args, "mmtok_mode", "none") != "none":
+        raise ValueError("--ttf-mode and --mmtok-mode cannot be enabled together")
+    if getattr(args, "kitoke_mode", "none") != "none":
+        raise ValueError("--ttf-mode and --kitoke-mode cannot be enabled together")
 
     version = getattr(args, "ttf_version", "v1")
     if version == "v2":
@@ -489,12 +602,18 @@ def configure_echoprune(args):
     if mode == "none":
         return
     conflicts = []
+    if getattr(args, "flashvid_mode", "none") != "none":
+        conflicts.append("--flashvid-mode")
     if getattr(args, "codec_guided_mode", "none") != "none":
         conflicts.append("--codec-guided-mode")
     if getattr(args, "vcast_mode", "none") != "none":
         conflicts.append("--vcast-mode")
     if getattr(args, "ttf_mode", "none") != "none":
         conflicts.append("--ttf-mode")
+    if getattr(args, "mmtok_mode", "none") != "none":
+        conflicts.append("--mmtok-mode")
+    if getattr(args, "kitoke_mode", "none") != "none":
+        conflicts.append("--kitoke-mode")
     if conflicts:
         raise ValueError(
             "--echoprune-mode cannot be enabled together with "
@@ -544,6 +663,292 @@ def configure_echoprune(args):
     print(f"   query_source={args.echoprune_query_source}")
     print(f"   match_chunk_size={args.echoprune_match_chunk_size}")
     print(f"   debug_verify={args.echoprune_debug_verify}")
+
+
+def _parse_float_tuple_csv(value):
+    if value is None:
+        return (0.05, 0.10, 0.15, 0.20)
+    if isinstance(value, (tuple, list)):
+        return tuple(float(x) for x in value)
+    return tuple(float(x.strip()) for x in str(value).split(",") if x.strip())
+
+
+def configure_mmtok(args):
+    mode = getattr(args, "mmtok_mode", "none")
+    if mode == "none":
+        return
+    conflicts = []
+    if getattr(args, "flashvid_mode", "none") != "none":
+        conflicts.append("--flashvid-mode")
+    if getattr(args, "codec_guided_mode", "none") != "none":
+        conflicts.append("--codec-guided-mode")
+    if getattr(args, "vcast_mode", "none") != "none":
+        conflicts.append("--vcast-mode")
+    if getattr(args, "ttf_mode", "none") != "none":
+        conflicts.append("--ttf-mode")
+    if getattr(args, "echoprune_mode", "none") != "none":
+        conflicts.append("--echoprune-mode")
+    if getattr(args, "kitoke_mode", "none") != "none":
+        conflicts.append("--kitoke-mode")
+    if conflicts:
+        raise ValueError("--mmtok-mode cannot be enabled together with " + ", ".join(conflicts))
+
+    target_visual_tokens = getattr(args, "mmtok_target_visual_tokens", None)
+    if target_visual_tokens is not None and target_visual_tokens <= 0:
+        target_visual_tokens = None
+    adaptive_candidates = _parse_float_tuple_csv(args.mmtok_adaptive_vv_candidates)
+
+    os.environ["QWEN3VL_MMTOK_MODE"] = mode
+    os.environ["QWEN3VL_MMTOK_PROFILE"] = args.mmtok_profile
+    os.environ["QWEN3VL_MMTOK_RETAIN_RATIO"] = str(args.mmtok_retain_ratio)
+    os.environ["QWEN3VL_MMTOK_TARGET_VISUAL_TOKENS"] = (
+        "" if target_visual_tokens is None else str(int(target_visual_tokens))
+    )
+    os.environ["QWEN3VL_MMTOK_BUDGET_ROUNDING"] = args.mmtok_budget_rounding
+    os.environ["QWEN3VL_MMTOK_ALPHA"] = str(args.mmtok_alpha)
+    os.environ["QWEN3VL_MMTOK_TV_TEMPERATURE"] = str(args.mmtok_tv_temperature)
+    os.environ["QWEN3VL_MMTOK_VV_TEMPERATURE"] = str(args.mmtok_vv_temperature)
+    os.environ["QWEN3VL_MMTOK_TEMPERATURE_MODE"] = args.mmtok_temperature_mode
+    os.environ["QWEN3VL_MMTOK_ADAPTIVE_VV_CANDIDATES"] = ",".join(str(x) for x in adaptive_candidates)
+    os.environ["QWEN3VL_MMTOK_VV_TARGET_MODE"] = args.mmtok_vv_target_mode
+    os.environ["QWEN3VL_MMTOK_VV_TARGET_TOKENS"] = str(args.mmtok_vv_target_tokens)
+    os.environ["QWEN3VL_MMTOK_GREEDY_MODE"] = args.mmtok_greedy_mode
+    os.environ["QWEN3VL_MMTOK_STOCHASTIC_EPSILON"] = str(args.mmtok_stochastic_epsilon)
+    os.environ["QWEN3VL_MMTOK_SELECTION_SEED"] = str(args.mmtok_selection_seed)
+    os.environ["QWEN3VL_MMTOK_QUERY_SOURCE"] = args.mmtok_query_source
+    os.environ["QWEN3VL_MMTOK_CANDIDATE_CHUNK_SIZE"] = str(args.mmtok_candidate_chunk_size)
+    os.environ["QWEN3VL_MMTOK_TARGET_CHUNK_SIZE"] = str(args.mmtok_target_chunk_size)
+    os.environ["QWEN3VL_MMTOK_EXACT_MAX_TOKENS"] = str(args.mmtok_exact_max_tokens)
+    os.environ["QWEN3VL_MMTOK_DEBUG_VERIFY"] = "1" if args.mmtok_debug_verify else "0"
+
+    from vllm_qwen3_vl_mmtok import apply_patch as apply_qwen3_vl_mmtok_patch
+
+    apply_qwen3_vl_mmtok_patch(
+        mode=mode,
+        profile=args.mmtok_profile,
+        retain_ratio=args.mmtok_retain_ratio,
+        target_visual_tokens=target_visual_tokens,
+        budget_rounding=args.mmtok_budget_rounding,
+        alpha=args.mmtok_alpha,
+        tv_temperature=args.mmtok_tv_temperature,
+        vv_temperature=args.mmtok_vv_temperature,
+        temperature_mode=args.mmtok_temperature_mode,
+        adaptive_vv_candidates=adaptive_candidates,
+        vv_target_mode=args.mmtok_vv_target_mode,
+        vv_target_tokens=args.mmtok_vv_target_tokens,
+        greedy_mode=args.mmtok_greedy_mode,
+        stochastic_epsilon=args.mmtok_stochastic_epsilon,
+        selection_seed=args.mmtok_selection_seed,
+        query_source=args.mmtok_query_source,
+        candidate_chunk_size=args.mmtok_candidate_chunk_size,
+        target_chunk_size=args.mmtok_target_chunk_size,
+        exact_max_tokens=args.mmtok_exact_max_tokens,
+        debug_verify=args.mmtok_debug_verify,
+    )
+
+    print("\n⚙️  MMTok vLLM patch:")
+    print(f"   mode={mode}")
+    print(f"   profile={args.mmtok_profile}")
+    print(f"   retain_ratio={args.mmtok_retain_ratio}")
+    print(f"   target_visual_tokens={target_visual_tokens}")
+    print(f"   alpha={args.mmtok_alpha}")
+    print(f"   tv_temperature={args.mmtok_tv_temperature}")
+    print(f"   vv_temperature={args.mmtok_vv_temperature}")
+    print(f"   temperature_mode={args.mmtok_temperature_mode}")
+    print(f"   adaptive_vv_candidates={adaptive_candidates}")
+    print(f"   vv_target_mode={args.mmtok_vv_target_mode}")
+    print(f"   vv_target_tokens={args.mmtok_vv_target_tokens}")
+    print(f"   greedy_mode={args.mmtok_greedy_mode}")
+    print(f"   stochastic_epsilon={args.mmtok_stochastic_epsilon}")
+    print(f"   selection_seed={args.mmtok_selection_seed}")
+    print(f"   query_source={args.mmtok_query_source}")
+    print(f"   debug_verify={args.mmtok_debug_verify}")
+
+
+def configure_kitoke(args):
+    mode = getattr(args, "kitoke_mode", "none")
+    if mode == "none":
+        return
+    conflicts = []
+    if getattr(args, "codec_guided_mode", "none") != "none":
+        conflicts.append("--codec-guided-mode")
+    if getattr(args, "vcast_mode", "none") != "none":
+        conflicts.append("--vcast-mode")
+    if getattr(args, "ttf_mode", "none") != "none":
+        conflicts.append("--ttf-mode")
+    if getattr(args, "echoprune_mode", "none") != "none":
+        conflicts.append("--echoprune-mode")
+    if getattr(args, "mmtok_mode", "none") != "none":
+        conflicts.append("--mmtok-mode")
+    if getattr(args, "flashvid_mode", "none") != "none":
+        conflicts.append("--flashvid-mode")
+    if conflicts:
+        raise ValueError("--kitoke-mode cannot be enabled together with " + ", ".join(conflicts))
+
+    target_visual_tokens = getattr(args, "kitoke_target_visual_tokens", None)
+    if target_visual_tokens is not None and target_visual_tokens <= 0:
+        target_visual_tokens = None
+
+    os.environ["QWEN3VL_KITOKE_MODE"] = mode
+    os.environ["QWEN3VL_KITOKE_RETAIN_RATIO"] = str(args.kitoke_retain_ratio)
+    os.environ["QWEN3VL_KITOKE_TARGET_VISUAL_TOKENS"] = (
+        "" if target_visual_tokens is None else str(int(target_visual_tokens))
+    )
+    os.environ["QWEN3VL_KITOKE_KERNEL_ALPHA"] = str(args.kitoke_kernel_alpha)
+    os.environ["QWEN3VL_KITOKE_SELECTION_METHOD"] = args.kitoke_selection_method
+    os.environ["QWEN3VL_KITOKE_SELECTION_SEED"] = str(args.kitoke_selection_seed)
+    os.environ["QWEN3VL_KITOKE_SEED_POLICY"] = args.kitoke_seed_policy
+    os.environ["QWEN3VL_KITOKE_PIVOTAL_PAIRING"] = args.kitoke_pivotal_pairing
+    os.environ["QWEN3VL_KITOKE_DIFF_THRESHOLD"] = str(args.kitoke_diff_threshold)
+    os.environ["QWEN3VL_KITOKE_DELTA_THRESHOLD"] = str(args.kitoke_delta_threshold)
+    os.environ["QWEN3VL_KITOKE_RELATIVE_DELTA_THRESHOLD"] = str(args.kitoke_relative_delta_threshold)
+    os.environ["QWEN3VL_KITOKE_EDGE_POLICY"] = args.kitoke_edge_policy
+    os.environ["QWEN3VL_KITOKE_EMPTY_INTERVAL_POLICY"] = args.kitoke_empty_interval_policy
+    os.environ["QWEN3VL_KITOKE_MERGE_MODE"] = args.kitoke_merge_mode
+    os.environ["QWEN3VL_KITOKE_DEEPSTACK_MODE"] = args.kitoke_deepstack_mode
+    os.environ["QWEN3VL_KITOKE_KERNEL_ROW_CHUNK_SIZE"] = str(args.kitoke_kernel_row_chunk_size)
+    os.environ["QWEN3VL_KITOKE_KERNEL_COL_CHUNK_SIZE"] = str(args.kitoke_kernel_col_chunk_size)
+    os.environ["QWEN3VL_KITOKE_FRAME_MATCH_CHUNK_SIZE"] = str(args.kitoke_frame_match_chunk_size)
+    os.environ["QWEN3VL_KITOKE_INTERVAL_MATCH_CHUNK_SIZE"] = str(args.kitoke_interval_match_chunk_size)
+    os.environ["QWEN3VL_KITOKE_DEBUG_VERIFY"] = "1" if args.kitoke_debug_verify else "0"
+
+    from vllm_qwen3_vl_kitoke import apply_patch as apply_qwen3_vl_kitoke_patch
+
+    apply_qwen3_vl_kitoke_patch(
+        mode=mode,
+        retain_ratio=args.kitoke_retain_ratio,
+        target_visual_tokens=target_visual_tokens,
+        kernel_alpha=args.kitoke_kernel_alpha,
+        selection_method=args.kitoke_selection_method,
+        selection_seed=args.kitoke_selection_seed,
+        seed_policy=args.kitoke_seed_policy,
+        pivotal_pairing=args.kitoke_pivotal_pairing,
+        diff_threshold=args.kitoke_diff_threshold,
+        delta_threshold=args.kitoke_delta_threshold,
+        relative_delta_threshold=args.kitoke_relative_delta_threshold,
+        edge_policy=args.kitoke_edge_policy,
+        empty_interval_policy=args.kitoke_empty_interval_policy,
+        merge_mode=args.kitoke_merge_mode,
+        deepstack_mode=args.kitoke_deepstack_mode,
+        kernel_row_chunk_size=args.kitoke_kernel_row_chunk_size,
+        kernel_col_chunk_size=args.kitoke_kernel_col_chunk_size,
+        frame_match_chunk_size=args.kitoke_frame_match_chunk_size,
+        interval_match_chunk_size=args.kitoke_interval_match_chunk_size,
+        debug_verify=args.kitoke_debug_verify,
+    )
+
+    print("\n⚙️  KiToke vLLM patch:")
+    print(f"   mode={mode}")
+    print(f"   retain_ratio={args.kitoke_retain_ratio}")
+    print(f"   target_visual_tokens={target_visual_tokens}")
+    print(f"   kernel_alpha={args.kitoke_kernel_alpha}")
+    print(f"   selection_method={args.kitoke_selection_method}")
+    print(f"   selection_seed={args.kitoke_selection_seed}")
+    print(f"   seed_policy={args.kitoke_seed_policy}")
+    print(f"   pivotal_pairing={args.kitoke_pivotal_pairing}")
+    print(f"   thresholds=({args.kitoke_diff_threshold}, {args.kitoke_delta_threshold}, {args.kitoke_relative_delta_threshold})")
+    print(f"   edge_policy={args.kitoke_edge_policy}")
+    print(f"   empty_interval_policy={args.kitoke_empty_interval_policy}")
+    print(f"   merge_mode={args.kitoke_merge_mode}")
+    print(f"   deepstack_mode={args.kitoke_deepstack_mode}")
+    print(f"   debug_verify={args.kitoke_debug_verify}")
+
+
+def configure_flashvid(args):
+    mode = getattr(args, "flashvid_mode", "none")
+    if mode == "none":
+        return
+    conflicts = []
+    if getattr(args, "codec_guided_mode", "none") != "none":
+        conflicts.append("--codec-guided-mode")
+    if getattr(args, "vcast_mode", "none") != "none":
+        conflicts.append("--vcast-mode")
+    if getattr(args, "ttf_mode", "none") != "none":
+        conflicts.append("--ttf-mode")
+    if getattr(args, "echoprune_mode", "none") != "none":
+        conflicts.append("--echoprune-mode")
+    if getattr(args, "mmtok_mode", "none") != "none":
+        conflicts.append("--mmtok-mode")
+    if getattr(args, "kitoke_mode", "none") != "none":
+        conflicts.append("--kitoke-mode")
+    if conflicts:
+        raise ValueError("--flashvid-mode cannot be enabled together with " + ", ".join(conflicts))
+
+    llm_retention_ratio = getattr(args, "flashvid_llm_retention_ratio", None)
+    if llm_retention_ratio is not None and llm_retention_ratio <= 0:
+        llm_retention_ratio = None
+
+    os.environ["QWEN3VL_FLASHVID_MODE"] = mode
+    os.environ["QWEN3VL_FLASHVID_PROFILE"] = args.flashvid_profile
+    os.environ["QWEN3VL_FLASHVID_BUDGET_MODE"] = args.flashvid_budget_mode
+    os.environ["QWEN3VL_FLASHVID_RETENTION_RATIO"] = str(args.flashvid_retention_ratio)
+    os.environ["QWEN3VL_FLASHVID_EXPANSION"] = str(args.flashvid_expansion)
+    os.environ["QWEN3VL_FLASHVID_ALPHA"] = str(args.flashvid_alpha)
+    os.environ["QWEN3VL_FLASHVID_TOKEN_SELECTION_METHOD"] = args.flashvid_token_selection_method or ""
+    os.environ["QWEN3VL_FLASHVID_TEMPORAL_THRESHOLD"] = str(args.flashvid_temporal_threshold)
+    os.environ["QWEN3VL_FLASHVID_DO_SEGMENT"] = "1" if args.flashvid_do_segment else "0"
+    os.environ["QWEN3VL_FLASHVID_SEGMENT_THRESHOLD"] = str(args.flashvid_segment_threshold)
+    os.environ["QWEN3VL_FLASHVID_MIN_SEGMENT_NUM"] = str(args.flashvid_min_segment_num)
+    os.environ["QWEN3VL_FLASHVID_COMPLEMENTARY_SEGMENT"] = (
+        "1" if args.flashvid_complementary_segment else "0"
+    )
+    os.environ["QWEN3VL_FLASHVID_BUDGET_CORRECTION"] = args.flashvid_budget_correction
+    os.environ["QWEN3VL_FLASHVID_DPC_K_MAX"] = str(args.flashvid_dpc_k_max)
+    os.environ["QWEN3VL_FLASHVID_DEEPSTACK_MODE"] = args.flashvid_deepstack_mode
+    os.environ["QWEN3VL_FLASHVID_CLS_ATTN_CHUNK_SIZE"] = str(args.flashvid_cls_attn_chunk_size)
+    os.environ["QWEN3VL_FLASHVID_TEMPORAL_MATCH_CHUNK_SIZE"] = str(args.flashvid_temporal_match_chunk_size)
+    os.environ["QWEN3VL_FLASHVID_PRUNING_LAYER"] = str(args.flashvid_pruning_layer)
+    os.environ["QWEN3VL_FLASHVID_LLM_RETENTION_RATIO"] = (
+        "" if llm_retention_ratio is None else str(llm_retention_ratio)
+    )
+    os.environ["QWEN3VL_FLASHVID_DEBUG_VERIFY"] = "1" if args.flashvid_debug_verify else "0"
+
+    from vllm_qwen3_vl_flashvid import apply_patch as apply_qwen3_vl_flashvid_patch
+
+    apply_qwen3_vl_flashvid_patch(
+        mode=mode,
+        profile=args.flashvid_profile,
+        budget_mode=args.flashvid_budget_mode,
+        retention_ratio=args.flashvid_retention_ratio,
+        expansion=args.flashvid_expansion,
+        alpha=args.flashvid_alpha,
+        token_selection_method=args.flashvid_token_selection_method,
+        temporal_threshold=args.flashvid_temporal_threshold,
+        do_segment=args.flashvid_do_segment,
+        segment_threshold=args.flashvid_segment_threshold,
+        min_segment_num=args.flashvid_min_segment_num,
+        complementary_segment=args.flashvid_complementary_segment,
+        budget_correction=args.flashvid_budget_correction,
+        dpc_k_max=args.flashvid_dpc_k_max,
+        deepstack_mode=args.flashvid_deepstack_mode,
+        cls_attention_query_chunk_size=args.flashvid_cls_attn_chunk_size,
+        temporal_match_chunk_size=args.flashvid_temporal_match_chunk_size,
+        pruning_layer=args.flashvid_pruning_layer,
+        llm_retention_ratio=llm_retention_ratio,
+        debug_verify=args.flashvid_debug_verify,
+    )
+
+    print("\n⚙️  FlashVID vLLM patch:")
+    print(f"   mode={mode}")
+    print(f"   profile={args.flashvid_profile}")
+    print(f"   budget_mode={args.flashvid_budget_mode}")
+    print(f"   retention_ratio={args.flashvid_retention_ratio}")
+    print(f"   expansion={args.flashvid_expansion}")
+    print(f"   alpha={args.flashvid_alpha}")
+    print(f"   token_selection_method={args.flashvid_token_selection_method}")
+    print(f"   temporal_threshold={args.flashvid_temporal_threshold}")
+    print(f"   do_segment={args.flashvid_do_segment}")
+    print(f"   segment_threshold={args.flashvid_segment_threshold}")
+    print(f"   min_segment_num={args.flashvid_min_segment_num}")
+    print(f"   complementary_segment={args.flashvid_complementary_segment}")
+    print(f"   budget_correction={args.flashvid_budget_correction}")
+    print(f"   dpc_k_max={args.flashvid_dpc_k_max}")
+    print(f"   deepstack_mode={args.flashvid_deepstack_mode}")
+    print(f"   cls_attn_chunk_size={args.flashvid_cls_attn_chunk_size}")
+    print(f"   temporal_match_chunk_size={args.flashvid_temporal_match_chunk_size}")
+    print(f"   pruning_layer={args.flashvid_pruning_layer}")
+    print(f"   llm_retention_ratio={llm_retention_ratio}")
+    print(f"   debug_verify={args.flashvid_debug_verify}")
 
 
 def run_evaluation(args):
@@ -716,6 +1121,25 @@ def main():
                             help="Maximum number of frames (default: 512)")
     infer_parser.add_argument("--total-pixels", type=int, default=24576*28*28,
                             help="Total pixels across all frames (default: 24576*28*28)")
+    infer_parser.add_argument("--vflow-mode", type=str, default="none",
+                            choices=["none", "post_vit"],
+                            help="Enable offline VFlow-responsibility-guided post-ViT pruning")
+    infer_parser.add_argument("--vflow-retain-ratio", type=float, default=0.125,
+                            help="VFlow visual token retain ratio (default: 0.125)")
+    infer_parser.add_argument("--vflow-target-visual-tokens", type=int, default=None,
+                            help="Optional absolute VFlow visual-token budget per video")
+    infer_parser.add_argument("--vflow-responsibility-dir", type=str, default=None,
+                            help="Directory containing VFlow responsibility .npz files or a responsibilities/ subdir")
+    infer_parser.add_argument("--vflow-signal", type=str, default="responsibility",
+                            choices=["responsibility", "direct_attention"],
+                            help="VFlow score array to use from each .npz file")
+    infer_parser.add_argument("--vflow-keep", type=str, default="high",
+                            choices=["high", "top", "low", "bottom"],
+                            help="Keep high- or low-score VFlow tokens (default: high)")
+    infer_parser.add_argument("--vflow-debug-verify", action="store_true",
+                            help="Enable strict VFlow invariant logging/checks")
+    infer_parser.add_argument("--vflow-quiet", action="store_true",
+                            help="Suppress per-video VFlow logs")
     infer_parser.add_argument("--codec-guided-mode", type=str, default="none",
                             choices=["none", "pre_vit", "post_vit"],
                             help="Enable codec-guided vLLM Qwen3-VL pruning")
@@ -787,6 +1211,147 @@ def main():
                             help="Chunk size for EchoPrune matching/relevance matmuls (default: 256)")
     infer_parser.add_argument("--echoprune-debug-verify", action="store_true",
                             help="Enable strict EchoPrune invariant logging/checks")
+    infer_parser.add_argument("--mmtok-mode", type=str, default="none",
+                            choices=["none", "post_vit"],
+                            help="Enable MMTok query-guided post-ViT pruning for vLLM Qwen3-VL")
+    infer_parser.add_argument("--mmtok-profile", type=str, default="auto",
+                            choices=["paper_exact", "video_scalable", "auto"],
+                            help="MMTok profile: exact paper-style video extension, scalable video mode, or auto")
+    infer_parser.add_argument("--mmtok-retain-ratio", type=float, default=0.20,
+                            help="MMTok visual token retain ratio (default: 0.20)")
+    infer_parser.add_argument("--mmtok-target-visual-tokens", type=int, default=None,
+                            help="Optional absolute MMTok visual-token budget per video")
+    infer_parser.add_argument("--mmtok-budget-rounding", type=str, default="floor",
+                            choices=["floor", "round"],
+                            help="How retain_ratio is converted to integer visual-token budget")
+    infer_parser.add_argument("--mmtok-alpha", type=float, default=0.50,
+                            help="MMTok visual coverage weight alpha (default: 0.50)")
+    infer_parser.add_argument("--mmtok-tv-temperature", type=float, default=0.01,
+                            help="MMTok text-vision softmax temperature (default: 0.01)")
+    infer_parser.add_argument("--mmtok-vv-temperature", type=float, default=0.20,
+                            help="MMTok vision-vision softmax temperature (default: 0.20)")
+    infer_parser.add_argument("--mmtok-temperature-mode", type=str, default="fixed",
+                            choices=["fixed", "adaptive_vv"],
+                            help="MMTok temperature mode; adaptive_vv selects vv temperature per video")
+    infer_parser.add_argument("--mmtok-adaptive-vv-candidates", type=str, default="0.05,0.10,0.15,0.20",
+                            help="Comma-separated candidate vv temperatures for adaptive_vv")
+    infer_parser.add_argument("--mmtok-vv-target-mode", type=str, default="stratified_3d",
+                            choices=["full", "stratified_3d"],
+                            help="MMTok visual target row mode (default: stratified_3d)")
+    infer_parser.add_argument("--mmtok-vv-target-tokens", type=int, default=1024,
+                            help="MMTok scalable visual target coreset size (default: 1024)")
+    infer_parser.add_argument("--mmtok-greedy-mode", type=str, default="auto",
+                            choices=["exact", "stochastic", "auto"],
+                            help="MMTok greedy optimizer mode")
+    infer_parser.add_argument("--mmtok-stochastic-epsilon", type=float, default=0.10,
+                            help="MMTok stochastic greedy epsilon (default: 0.10)")
+    infer_parser.add_argument("--mmtok-selection-seed", type=int, default=3407,
+                            help="MMTok request-local stochastic selection seed")
+    infer_parser.add_argument("--mmtok-query-source", type=str, default="question_options",
+                            choices=["question", "question_options", "user_text", "all_text"],
+                            help="Text used for MMTok query embeddings (default: question_options)")
+    infer_parser.add_argument("--mmtok-candidate-chunk-size", type=int, default=512,
+                            help="Candidate chunk size for MMTok global softmax/logZ")
+    infer_parser.add_argument("--mmtok-target-chunk-size", type=int, default=256,
+                            help="Target chunk size reserved for MMTok diagnostics/scalable path")
+    infer_parser.add_argument("--mmtok-exact-max-tokens", type=int, default=1024,
+                            help="Maximum dense tokens allowed for exact MMTok profile/greedy")
+    infer_parser.add_argument("--mmtok-debug-verify", action="store_true",
+                            help="Enable strict MMTok invariant and temperature diagnostics")
+    infer_parser.add_argument("--flashvid-mode", type=str, default="none",
+                            choices=["none", "post_vit", "hybrid"],
+                            help="Enable FlashVID vision-side post-ViT merging for vLLM Qwen3-VL")
+    infer_parser.add_argument("--flashvid-profile", type=str, default="official_qwen3",
+                            choices=["official_qwen3", "paper_adts_v2", "custom"],
+                            help="FlashVID profile: official Qwen3 ADTS v1, paper ADTS v2, or custom")
+    infer_parser.add_argument("--flashvid-budget-mode", type=str, default="direct",
+                            choices=["direct", "paper_hybrid"],
+                            help="FlashVID budget interpretation; direct is default for post_vit")
+    infer_parser.add_argument("--flashvid-retention-ratio", type=float, default=0.20,
+                            help="FlashVID requested visual token retention ratio (default: 0.20)")
+    infer_parser.add_argument("--flashvid-expansion", type=float, default=1.25,
+                            help="FlashVID hybrid pre-LLM expansion factor (default: 1.25)")
+    infer_parser.add_argument("--flashvid-alpha", type=float, default=0.70,
+                            help="FlashVID ADTS budget fraction alpha (default: 0.70)")
+    infer_parser.add_argument("--flashvid-token-selection-method", type=str, default=None,
+                            choices=["attn", "div", "attn_div", "attn_div_v2"],
+                            help="Override FlashVID token selection method")
+    infer_parser.add_argument("--flashvid-temporal-threshold", type=float, default=0.80,
+                            help="FlashVID TSTM strict temporal merge threshold (default: 0.80)")
+    infer_parser.add_argument("--flashvid-do-segment", action=argparse.BooleanOptionalAction, default=True,
+                            help="Enable/disable FlashVID DySeg dynamic segmentation")
+    infer_parser.add_argument("--flashvid-segment-threshold", type=float, default=0.90,
+                            help="FlashVID DySeg transition threshold (default: 0.90)")
+    infer_parser.add_argument("--flashvid-min-segment-num", type=int, default=4,
+                            help="FlashVID minimum segment count with complementary cuts (default: 4)")
+    infer_parser.add_argument("--flashvid-complementary-segment", action=argparse.BooleanOptionalAction, default=True,
+                            help="Enable/disable FlashVID complementary segmentation cuts")
+    infer_parser.add_argument("--flashvid-budget-correction", type=str, default="official_ceil",
+                            choices=["official_ceil", "exact_total"],
+                            help="FlashVID DPC frame budget correction policy")
+    infer_parser.add_argument("--flashvid-dpc-k-max", type=int, default=7,
+                            help="FlashVID DPC-kNN maximum k (default: 7)")
+    infer_parser.add_argument("--flashvid-deepstack-mode", type=str, default="official_gather",
+                            choices=["official_gather", "hierarchical_mean"],
+                            help="FlashVID deepstack handling; official default gathers representative rows")
+    infer_parser.add_argument("--flashvid-cls-attn-chunk-size", type=int, default=128,
+                            help="Query chunk size for FlashVID incoming vision attention")
+    infer_parser.add_argument("--flashvid-temporal-match-chunk-size", type=int, default=256,
+                            help="Current-token chunk size for FlashVID TSTM matching")
+    infer_parser.add_argument("--flashvid-pruning-layer", type=int, default=28,
+                            help="FlashVID hybrid pruning layer index (hybrid currently fail-fast)")
+    infer_parser.add_argument("--flashvid-llm-retention-ratio", type=float, default=None,
+                            help="Optional explicit inner-LLM retention ratio for hybrid")
+    infer_parser.add_argument("--flashvid-debug-verify", action="store_true",
+                            help="Enable strict FlashVID invariant logging/checks")
+    infer_parser.add_argument("--kitoke-mode", type=str, default="none",
+                            choices=["none", "post_vit"],
+                            help="Enable KiToke post-ViT kernel/interval token merging for vLLM Qwen3-VL")
+    infer_parser.add_argument("--kitoke-retain-ratio", type=float, default=0.10,
+                            help="KiToke visual token retain ratio (default: 0.10)")
+    infer_parser.add_argument("--kitoke-target-visual-tokens", type=int, default=None,
+                            help="Optional absolute KiToke visual-token budget per video")
+    infer_parser.add_argument("--kitoke-kernel-alpha", type=float, default=800.0,
+                            help="KiToke Gaussian kernel denominator alpha (default: 800)")
+    infer_parser.add_argument("--kitoke-selection-method", type=str, default="pivotal",
+                            choices=["pivotal", "multinomial", "topk"],
+                            help="KiToke fixed-size selection method")
+    infer_parser.add_argument("--kitoke-selection-seed", type=int, default=3407,
+                            help="KiToke engineering reproducibility seed")
+    infer_parser.add_argument("--kitoke-seed-policy", type=str, default="stable_video",
+                            choices=["stable_video", "fixed"],
+                            help="KiToke seed policy (default: stable_video)")
+    infer_parser.add_argument("--kitoke-pivotal-pairing", type=str, default="random_rounds",
+                            choices=["random_rounds", "sequential"],
+                            help="KiToke pivotal sampling pair schedule")
+    infer_parser.add_argument("--kitoke-diff-threshold", type=float, default=110.0,
+                            help="KiToke absolute transition boundary threshold (default: 110)")
+    infer_parser.add_argument("--kitoke-delta-threshold", type=float, default=70.0,
+                            help="KiToke local absolute deviation threshold (default: 70)")
+    infer_parser.add_argument("--kitoke-relative-delta-threshold", type=float, default=0.40,
+                            help="KiToke local relative deviation threshold (default: 0.4)")
+    infer_parser.add_argument("--kitoke-edge-policy", type=str, default="absolute_only",
+                            choices=["absolute_only", "one_sided"],
+                            help="KiToke edge transition local-deviation policy")
+    infer_parser.add_argument("--kitoke-empty-interval-policy", type=str, default="repair_swap",
+                            choices=["paper_strict", "repair_swap", "coarsen_then_repair"],
+                            help="KiToke policy for intervals with no sampled representative")
+    infer_parser.add_argument("--kitoke-merge-mode", type=str, default="weighted",
+                            choices=["weighted", "uniform", "none"],
+                            help="KiToke merge mode; weighted is paper-compatible default")
+    infer_parser.add_argument("--kitoke-deepstack-mode", type=str, default="same_weighted_merge",
+                            choices=["same_weighted_merge", "representative_gather"],
+                            help="KiToke Qwen3-VL deepstack handling")
+    infer_parser.add_argument("--kitoke-kernel-row-chunk-size", type=int, default=256,
+                            help="KiToke KDE row chunk size")
+    infer_parser.add_argument("--kitoke-kernel-col-chunk-size", type=int, default=512,
+                            help="KiToke KDE candidate chunk size")
+    infer_parser.add_argument("--kitoke-frame-match-chunk-size", type=int, default=256,
+                            help="KiToke adjacent-frame matching chunk size")
+    infer_parser.add_argument("--kitoke-interval-match-chunk-size", type=int, default=256,
+                            help="KiToke interval assignment chunk size")
+    infer_parser.add_argument("--kitoke-debug-verify", action="store_true",
+                            help="Enable strict KiToke invariant logging/checks")
     
     # vLLM specific parameters
     infer_parser.add_argument("--tensor-parallel-size", type=int, default=None, 

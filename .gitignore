@@ -7,3 +7,14 @@ evaluation/VideoMME/__pycache__/
 evaluation/VideoMME/results/
 *.out
 *.err
+
+# Generated experiment artifacts
+*.npz
+*.npy
+*.pt
+*.pth
+*.safetensors
+*.jsonl
+*.log
+visualizations/
+outputs/

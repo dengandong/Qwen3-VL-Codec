@@ -190,6 +190,28 @@ def _vcast_select_for_grid(
             local = _vcast_select_for_video(frames, retain_ratio, min_k)
             if local.numel() == 0:
                 local = torch.arange(num, device=hidden_states.device, dtype=torch.long)
+        try:
+            from vllm_qwen3_vl_index_dump import dump_video_selection
+
+            dump_video_selection(
+                method="vcast",
+                video_index=row_idx,
+                grid_thw=row,
+                spatial_merge_size=spatial_merge_size,
+                dense_token_count=num,
+                keep_indices=local,
+                output_indices=local,
+                extra={
+                    "retain_ratio": float(retain_ratio),
+                    "min_k": int(min_k),
+                    "budget_temp": float(_budget_temp()),
+                },
+            )
+        except Exception as exc:
+            if os.environ.get("QWEN3VL_INDEX_DUMP_STRICT", "0") == "1":
+                raise
+            if os.environ.get("QWEN3VL_INDEX_DUMP_DIR"):
+                print(f"[V-CAST-vLLM] index dump failed for video[{row_idx}]: {exc}")
         chunks.append(local + offset)
         if _verbose() and local.numel() < num:
             print(f"[V-CAST-vLLM] video[{row_idx}] keep_tokens={local.numel()}/{num}")

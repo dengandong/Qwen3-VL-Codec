@@ -798,6 +798,36 @@ def _compress_video_outputs(
         out = torch.cat([selected_main] + selected_deep + [selected_pos], dim=1)
         chunks.append(out)
 
+        if plan is not None:
+            try:
+                from vllm_qwen3_vl_index_dump import dump_video_selection
+
+                dump_video_selection(
+                    method="echoprune",
+                    video_index=video_idx,
+                    grid_thw=row,
+                    spatial_merge_size=spatial_merge_size,
+                    dense_token_count=dense_tokens,
+                    keep_indices=plan.keep_flat_indices,
+                    output_indices=plan.keep_flat_indices,
+                    num_tokens_per_frame=plan.num_tokens_per_frame,
+                    extra={
+                        "retain_ratio": float(_retain_ratio()),
+                        "target_visual_tokens": _target_visual_tokens(),
+                        "temperature": float(_temperature()),
+                        "match_scope": str(_match_scope()),
+                        "window_size": int(_window_size()),
+                        "first_frame_policy": str(_first_frame_policy()),
+                        "query_source": str(_query_source()),
+                        "query_token_count": int(plan.query_token_count),
+                    },
+                )
+            except Exception as exc:
+                if os.environ.get("QWEN3VL_INDEX_DUMP_STRICT", "0") == "1":
+                    raise
+                if os.environ.get("QWEN3VL_INDEX_DUMP_DIR"):
+                    print(f"[EchoPrune-vLLM] index dump failed for video[{video_idx}]: {exc}")
+
         if _verbose() or debug_verify:
             if plan is None:
                 reduction = 1.0 - (int(target) / max(dense_tokens, 1))

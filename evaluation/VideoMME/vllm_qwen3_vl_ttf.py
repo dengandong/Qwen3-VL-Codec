@@ -476,6 +476,34 @@ def _compress_video_outputs(
         out = torch.cat([selected_main] + selected_deep + [selected_pos], dim=1)
         chunks.append(out)
 
+        try:
+            from vllm_qwen3_vl_index_dump import dump_video_selection
+
+            dump_video_selection(
+                method="ttf",
+                video_index=video_idx,
+                grid_thw=row,
+                spatial_merge_size=spatial_merge_size,
+                dense_token_count=dense_tokens,
+                keep_indices=plan.keep_flat_indices,
+                output_indices=plan.output_flat_indices,
+                num_tokens_per_frame=plan.num_tokens_per_original_frame,
+                extra={
+                    "anchor_idx": int(plan.anchor_idx),
+                    "order": str(order),
+                    "budget_mode": str(budget_mode),
+                    "retain_ratio": float(retain_ratio),
+                    "threshold": float(threshold),
+                    "window_radius": int(window_radius),
+                    "effective_threshold": plan.effective_threshold,
+                },
+            )
+        except Exception as exc:
+            if os.environ.get("QWEN3VL_INDEX_DUMP_STRICT", "0") == "1":
+                raise
+            if os.environ.get("QWEN3VL_INDEX_DUMP_DIR"):
+                print(f"[TTF-vLLM] index dump failed for video[{video_idx}]: {exc}")
+
         if _verbose() or debug_verify:
             reduction = 1.0 - (plan.retained_token_count / max(plan.original_token_count, 1))
             eff = (
